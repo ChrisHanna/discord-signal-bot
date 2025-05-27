@@ -210,6 +210,15 @@ print(f"   Strong signals only: {ONLY_STRONG_SIGNALS}")
 # Global timer tracking for bot commands
 loop_start_time = None
 checks_completed = 0
+bot_start_time = None
+last_successful_check = None
+health_stats = {
+    'total_signals_found': 0,
+    'total_notifications_sent': 0,
+    'failed_checks': 0,
+    'api_errors': 0,
+    'discord_errors': 0
+}
 
 class SignalNotifier:
     def __init__(self, bot):
@@ -759,15 +768,25 @@ class SignalNotifier:
                     'color': '#ff6666'
                 })
         
-        # Sort all signals by date (most recent first)
-        def get_signal_date(signal):
+        # Sort all signals by date (most recent first) with enhanced datetime handling
+        def get_signal_datetime(signal):
+            """Enhanced sorting function to handle both date-only and full timestamps"""
             try:
-                date_str = signal['date'].split(' ')[0]  # Get just the date part
-                return datetime.strptime(date_str, '%Y-%m-%d')
-            except:
+                date_str = signal.get('date', '')
+                if not date_str:
+                    return datetime.min
+                
+                if ' ' in date_str:
+                    # Full timestamp (e.g., "2025-01-27 14:30:00")
+                    return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                else:
+                    # Date only (e.g., "2025-01-27") - assume end of day for better sorting
+                    base_date = datetime.strptime(date_str, '%Y-%m-%d')
+                    return base_date.replace(hour=23, minute=59, second=59)
+            except (ValueError, TypeError):
                 return datetime.min
         
-        all_signals.sort(key=get_signal_date, reverse=True)
+        all_signals.sort(key=get_signal_datetime, reverse=True)
         
         # Create summary by system
         system_counts = {}
@@ -938,6 +957,10 @@ class SignalNotifier:
         if 'rsi3m3' in system and 'bullish' in signal_type:
             return True
         
+        # RSI3M3+ bearish entries are also always important
+        if 'rsi3m3' in system and 'bearish' in signal_type:
+            return True
+        
         # Money flow divergences with strong strength
         if 'money flow' in system and strength == 'strong':
             return True
@@ -948,9 +971,42 @@ class SignalNotifier:
         """Format a signal for Discord notification with EST timestamps"""
         # Get emoji based on signal type
         emoji = {
+            # Wave Trend Signals
             'WT Buy Signal': '📈',
             'WT Gold Buy Signal': '⭐',
             'WT Sell Signal': '📉',
+            'WT Bullish Cross': '🟢',
+            'WT Bearish Cross': '🔴',
+            
+            # RSI3M3+ Signals (FIXED MAPPING)
+            'RSI3M3 Bullish Entry': '🟢',
+            'RSI3M3 Bearish Entry': '🔴',
+            
+            # Divergence Signals
+            'Bullish Divergence': '📈',
+            'Bearish Divergence': '📉',
+            'Hidden Bullish Divergence': '🔼',
+            'Hidden Bearish Divergence': '🔽',
+            'Bullish MF Divergence': '💚',
+            'Bearish MF Divergence': '❤️',
+            
+            # Pattern Signals
+            'Fast Money Buy': '💰',
+            'Fast Money Sell': '💸',
+            'RSI Trend Break Buy': '⬆️',
+            'RSI Trend Break Sell': '⬇️',
+            'Zero Line Reject Buy': '🚀',
+            'Zero Line Reject Sell': '📉',
+            
+            # Trend Exhaustion Signals
+            'Bear Cross Signal': '🐻',
+            'Bull Cross Signal': '🐂',
+            'Oversold Reversal': '🔄',
+            'Overbought Reversal': '🔄',
+            'Extreme Oversold': '💚',
+            'Extreme Overbought': '❤️',
+            
+            # Legacy mappings (for backward compatibility)
             'RSI3M3 Bull': '🟢',
             'RSI3M3 Bear': '🔴',
             'Exhaustion Oversold': '💚',
@@ -1059,29 +1115,48 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    global loop_start_time
+    global loop_start_time, bot_start_time
+    bot_start_time = datetime.now(EST)
     print(f'🤖 {bot.user} has connected to Discord!')
-    print(f"📊 Monitoring tickers every {CHECK_INTERVAL} seconds")
+    print(f"🚀 Bot started at: {bot_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+    print(f"📊 Monitoring {len(TICKER_TF_COMBINATIONS)} ticker-timeframe combinations")
+    print(f"⏰ Signal check interval: {CHECK_INTERVAL} seconds ({CHECK_INTERVAL/60:.1f} minutes)")
+    print(f"🌐 API endpoint: {API_BASE_URL}")
+    print(f"📡 Discord channel: {CHANNEL_ID}")
+    
+    # Railway deployment detection
+    if os.getenv('RAILWAY_ENVIRONMENT'):
+        print(f"🚂 Running on Railway deployment: {os.getenv('RAILWAY_ENVIRONMENT')}")
+        print(f"🔧 Railway service: {os.getenv('RAILWAY_SERVICE_NAME', 'discord-bot')}")
+    
     if not signal_check_loop.is_running():
-        loop_start_time = datetime.now()
+        loop_start_time = datetime.now(EST)
         signal_check_loop.start()
+        print(f"✅ Signal monitoring loop started at: {loop_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+    else:
+        print("⚠️ Signal monitoring loop was already running")
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def signal_check_loop():
-    """Enhanced signal monitoring loop with comprehensive detection"""
+    """Enhanced signal monitoring loop with comprehensive detection and health tracking"""
     if not bot.is_ready():
         return
     
-    global loop_start_time
-    global checks_completed
+    global loop_start_time, checks_completed, last_successful_check, health_stats
     
     try:
-        loop_start_time = datetime.now()
+        cycle_start = datetime.now(EST)
+        loop_start_time = cycle_start
         checks_completed += 1
         total_signals = 0
         notified_signals = 0
         
-        print(f"\n🔄 Starting signal check cycle #{checks_completed} at {loop_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\n🔄 Starting signal check cycle #{checks_completed}")
+        print(f"🕐 Cycle start time: {cycle_start.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+        
+        # Railway health logging
+        if os.getenv('RAILWAY_ENVIRONMENT'):
+            print(f"🚂 Railway check #{checks_completed} - Memory usage available")
         
         # Create notifier instance
         notifier = SignalNotifier(bot)
@@ -1093,6 +1168,9 @@ async def signal_check_loop():
                 print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
         
         # Check each ticker across all timeframes
+        api_errors = 0
+        discord_errors = 0
+        
         for ticker in TICKERS:
             for timeframe in TIMEFRAMES:
                 try:
@@ -1114,8 +1192,14 @@ async def signal_check_loop():
                             
                             # Send notifications for qualifying signals
                             for signal in notify_signals:
-                                await notifier.send_signal_notification(signal, ticker, timeframe)
-                                await asyncio.sleep(1)  # Rate limiting
+                                try:
+                                    await notifier.send_signal_notification(signal, ticker, timeframe)
+                                    await asyncio.sleep(1)  # Rate limiting
+                                    health_stats['total_notifications_sent'] += 1
+                                except Exception as e:
+                                    print(f"❌ Discord error sending notification: {e}")
+                                    discord_errors += 1
+                                    health_stats['discord_errors'] += 1
                         else:
                             print(f"🔕 No signals meet notification criteria for {ticker} ({timeframe})")
                     else:
@@ -1124,16 +1208,27 @@ async def signal_check_loop():
                     # Brief pause between tickers
                     await asyncio.sleep(0.5)
                     
+                except requests.exceptions.RequestException as e:
+                    print(f"❌ API error checking {ticker} ({timeframe}): {e}")
+                    api_errors += 1
+                    health_stats['api_errors'] += 1
+                    continue
                 except Exception as e:
-                    print(f"❌ Error checking {ticker} ({timeframe}): {e}")
+                    print(f"❌ Unexpected error checking {ticker} ({timeframe}): {e}")
                     continue
         
-        # Calculate next check time and update bot activity
-        next_check = loop_start_time + timedelta(seconds=CHECK_INTERVAL)
-        time_until_next = (next_check - datetime.now()).total_seconds()
+        # Update health stats
+        health_stats['total_signals_found'] += total_signals
+        last_successful_check = cycle_start
         
+        # Calculate next check time and update bot activity
+        cycle_end = datetime.now(EST)
+        cycle_duration = (cycle_end - cycle_start).total_seconds()
+        next_check = cycle_start + timedelta(seconds=CHECK_INTERVAL)
+        time_until_next = (next_check - cycle_end).total_seconds()
+        
+        # Update bot presence with enhanced status
         if time_until_next > 0:
-            # Update bot presence with countdown
             hours = int(time_until_next // 3600)
             minutes = int((time_until_next % 3600) // 60)
             seconds = int(time_until_next % 60)
@@ -1152,15 +1247,42 @@ async def signal_check_loop():
                 )
             )
         
-        # Summary log
-        cycle_duration = (datetime.now() - loop_start_time).total_seconds()
-        print(f"\n📋 Cycle #{checks_completed} completed in {cycle_duration:.1f}s")
+        # Enhanced summary logging
+        print(f"\n📋 Cycle #{checks_completed} completed successfully!")
+        print(f"⏱️ Duration: {cycle_duration:.1f} seconds")
         print(f"📊 Total signals found: {total_signals}")
         print(f"🚨 Notifications sent: {notified_signals}")
-        print(f"⏰ Next check: {next_check.strftime('%H:%M:%S')}")
+        print(f"❌ API errors: {api_errors}")
+        print(f"❌ Discord errors: {discord_errors}")
+        print(f"⏰ Next check: {next_check.strftime('%I:%M:%S %p EST')}")
+        
+        # Railway-specific logging
+        if os.getenv('RAILWAY_ENVIRONMENT'):
+            uptime = cycle_end - bot_start_time if bot_start_time else timedelta(0)
+            print(f"🚂 Railway uptime: {uptime}")
+            print(f"🔧 Railway health: ✅ Loop running normally")
                 
     except Exception as e:
-        print(f"❌ Error in signal check loop: {e}")
+        print(f"❌ Critical error in signal check loop: {e}")
+        health_stats['failed_checks'] += 1
+        
+        # Try to notify about the error
+        try:
+            channel = bot.get_channel(CHANNEL_ID)
+            if channel:
+                embed = discord.Embed(
+                    title="⚠️ Bot Health Alert",
+                    description=f"Signal check cycle #{checks_completed} failed",
+                    color=0xff0000,
+                    timestamp=datetime.now(EST)
+                )
+                embed.add_field(name="Error", value=str(e)[:1000], inline=False)
+                embed.add_field(name="Cycle", value=f"#{checks_completed}", inline=True)
+                embed.add_field(name="Time", value=datetime.now(EST).strftime('%I:%M:%S %p EST'), inline=True)
+                await channel.send(embed=embed)
+        except:
+            pass  # Don't let notification errors crash the loop
+        
         await asyncio.sleep(60)  # Wait before retrying
 
 @bot.command(name='signals')
@@ -1188,26 +1310,92 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
             await ctx.send(f"❌ No signals found for {ticker.upper()} ({timeframe})")
             return
         
-        # Show last 5 signals
+        # Enhanced sorting to ensure most recent signals first
+        def get_signal_datetime(signal):
+            """Enhanced sorting function to handle both date-only and full timestamps"""
+            try:
+                date_str = signal.get('date', '')
+                if not date_str:
+                    return datetime.min
+                
+                if ' ' in date_str:
+                    # Full timestamp (e.g., "2025-01-27 14:30:00")
+                    return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                else:
+                    # Date only (e.g., "2025-01-27") - assume end of day for better sorting
+                    base_date = datetime.strptime(date_str, '%Y-%m-%d')
+                    return base_date.replace(hour=23, minute=59, second=59)
+            except (ValueError, TypeError):
+                return datetime.min
+        
+        # Sort signals by datetime (most recent first)
+        signals.sort(key=get_signal_datetime, reverse=True)
+        
+        # Show most recent 5 signals
         recent_signals = signals[:5]
         
         embed = discord.Embed(
-            title=f"📊 Recent Signals for {ticker.upper()} ({timeframe})",
+            title=f"🚨 Latest Signals for {ticker.upper()} ({timeframe})",
+            description="📅 **Showing most recent alerts first**",
             color=0x0099ff,
             timestamp=datetime.now(EST)
         )
         
-        # Add summary information
+        # Add summary information with enhanced details
+        total_signals = len(signals)
+        showing_count = len(recent_signals)
+        
+        # Count signals by recency
+        now = datetime.now()
+        today_signals = 0
+        week_signals = 0
+        
+        for signal in signals:
+            try:
+                signal_date = signal.get('date', '')
+                if ' ' in signal_date:
+                    parsed_date = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
+                else:
+                    parsed_date = datetime.strptime(signal_date, '%Y-%m-%d')
+                
+                days_diff = (now - parsed_date).days
+                if days_diff == 0:
+                    today_signals += 1
+                if days_diff <= 7:
+                    week_signals += 1
+            except:
+                continue
+        
         embed.add_field(
-            name="📈 Summary", 
-            value=f"**Total Signals:** {len(signals)}\n**Timeframe:** {timeframe}\n**Showing:** Last {len(recent_signals)} signals", 
+            name="📊 Signal Summary", 
+            value=f"**Total Found:** {total_signals} signals\n"
+                  f"**Today:** {today_signals} signals\n"
+                  f"**This Week:** {week_signals} signals\n"
+                  f"**Showing:** {showing_count} most recent", 
             inline=False
         )
         
+        # Add individual signals with enhanced timing info
         for i, signal in enumerate(recent_signals, 1):
-            # Calculate EST-based timing
+            # Calculate EST-based timing with enhanced display
             signal_date = signal.get('date', '')
             timing_est = calculate_time_ago_est(signal_date)
+            
+            # Enhanced timing display with urgency indicators
+            if timing_est == "Just now":
+                timing_display = "⚡ Just now"
+            elif "m ago" in timing_est and int(timing_est.split('m')[0].split()[-1]) <= 60:
+                # Less than 1 hour
+                timing_display = f"⚡ {timing_est}"
+            elif "h ago" in timing_est and int(timing_est.split('h')[0].split()[-1]) <= 4:
+                # Less than 4 hours
+                timing_display = f"🔥 {timing_est}"
+            elif "day" in timing_est and "1 day" in timing_est:
+                # Yesterday
+                timing_display = f"📅 {timing_est}"
+            else:
+                # Older signals
+                timing_display = f"📆 {timing_est}"
             
             # Format timestamp display in EST
             if ' ' in signal_date:
@@ -1217,23 +1405,38 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
                 # Date only (common for 1d data)
                 date_display = f"📅 {format_est_timestamp(signal_date, show_time=False)}"
             
-            # Add strength indicator
+            # Add strength indicator with enhanced emojis
             strength = signal.get('strength', '')
-            strength_emoji = {
-                'Very Strong': '🔥🔥🔥',
-                'Strong': '🔥🔥', 
-                'Moderate': '🔥',
-                'Weak': '💧'
-            }.get(strength, '')
+            signal_type = signal.get('type', 'Unknown')
+            
+            if 'Gold' in signal_type:
+                strength_emoji = '⭐🔥🔥🔥'
+            elif strength == 'Very Strong':
+                strength_emoji = '🔥🔥🔥'
+            elif strength == 'Strong':
+                strength_emoji = '🔥🔥'
+            elif strength == 'Moderate':
+                strength_emoji = '🔥'
+            else:
+                strength_emoji = '💧'
+            
+            # Enhanced signal type emoji
+            type_emoji = '🟢' if any(word in signal_type.lower() for word in ['buy', 'bullish']) else '🔴' if any(word in signal_type.lower() for word in ['sell', 'bearish']) else '🟡'
             
             embed.add_field(
-                name=f"{i}. {signal.get('type', 'Unknown')} {strength_emoji}",
-                value=f"**System:** {signal.get('system', 'Unknown')}\n**Strength:** {strength}\n⏰ {timing_est}\n{date_display}",
+                name=f"{type_emoji} #{i} {signal_type} {strength_emoji}",
+                value=f"**System:** {signal.get('system', 'Unknown')}\n"
+                      f"**Strength:** {strength}\n"
+                      f"**When:** {timing_display}\n"
+                      f"{date_display}",
                 inline=True
             )
         
-        # Add footer with helpful info
-        embed.set_footer(text=f"💡 Use !signals {ticker.upper()} <timeframe> to check other timeframes")
+        # Add navigation footer
+        if total_signals > showing_count:
+            embed.set_footer(text=f"💡 Showing {showing_count} of {total_signals} signals • Use !signals {ticker.upper()} <timeframe> for other timeframes")
+        else:
+            embed.set_footer(text=f"💡 All {total_signals} signals displayed • Use !signals {ticker.upper()} <timeframe> for other timeframes")
         
     await ctx.send(embed=embed)
 
@@ -1932,6 +2135,220 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
             
     except Exception as e:
         await ctx.send(f"❌ Error managing timeframes: {str(e)}")
+
+@bot.command(name='health')
+async def health_check(ctx):
+    """Comprehensive bot health check for monitoring Railway deployment"""
+    try:
+        now = datetime.now(EST)
+        
+        # Calculate uptime
+        uptime = now - bot_start_time if bot_start_time else timedelta(0)
+        uptime_str = f"{uptime.days}d {uptime.seconds//3600}h {(uptime.seconds%3600)//60}m"
+        
+        # Calculate time since last check
+        time_since_last = now - last_successful_check if last_successful_check else None
+        
+        # Determine health status
+        is_healthy = True
+        health_issues = []
+        
+        if not signal_check_loop.is_running():
+            is_healthy = False
+            health_issues.append("Signal loop not running")
+            
+        if time_since_last and time_since_last.total_seconds() > (CHECK_INTERVAL * 2):
+            is_healthy = False
+            health_issues.append(f"Last check was {time_since_last.total_seconds()//60:.0f}m ago")
+            
+        if health_stats['failed_checks'] > (checks_completed * 0.1):  # More than 10% failure rate
+            is_healthy = False
+            health_issues.append("High failure rate detected")
+        
+        # Create health embed
+        embed = discord.Embed(
+            title="🏥 Bot Health Status",
+            description="🚂 **Railway Deployment Monitor**",
+            color=0x00ff00 if is_healthy else 0xff0000,
+            timestamp=now
+        )
+        
+        # Basic status
+        embed.add_field(
+            name="🤖 Bot Status", 
+            value=f"**Status:** {'🟢 Healthy' if is_healthy else '🔴 Issues Detected'}\n"
+                  f"**Uptime:** {uptime_str}\n"
+                  f"**Started:** {bot_start_time.strftime('%m/%d %I:%M %p EST') if bot_start_time else 'Unknown'}",
+            inline=True
+        )
+        
+        # Loop status
+        loop_status = "🟢 Running" if signal_check_loop.is_running() else "🔴 Stopped"
+        last_check_str = last_successful_check.strftime('%I:%M:%S %p EST') if last_successful_check else "Never"
+        
+        embed.add_field(
+            name="⏰ Signal Loop", 
+            value=f"**Status:** {loop_status}\n"
+                  f"**Cycles:** {checks_completed}\n"
+                  f"**Last Check:** {last_check_str}",
+            inline=True
+        )
+        
+        # Railway info
+        railway_env = os.getenv('RAILWAY_ENVIRONMENT', 'Local')
+        railway_service = os.getenv('RAILWAY_SERVICE_NAME', 'discord-bot')
+        
+        embed.add_field(
+            name="🚂 Railway Info", 
+            value=f"**Environment:** {railway_env}\n"
+                  f"**Service:** {railway_service}\n"
+                  f"**Region:** {os.getenv('RAILWAY_REGION', 'Unknown')}",
+            inline=True
+        )
+        
+        # Performance stats
+        success_rate = ((checks_completed - health_stats['failed_checks']) / max(checks_completed, 1)) * 100
+        
+        embed.add_field(
+            name="📊 Performance", 
+            value=f"**Success Rate:** {success_rate:.1f}%\n"
+                  f"**Signals Found:** {health_stats['total_signals_found']}\n"
+                  f"**Notifications:** {health_stats['total_notifications_sent']}",
+            inline=True
+        )
+        
+        # Error tracking
+        embed.add_field(
+            name="❌ Error Count", 
+            value=f"**Failed Checks:** {health_stats['failed_checks']}\n"
+                  f"**API Errors:** {health_stats['api_errors']}\n"
+                  f"**Discord Errors:** {health_stats['discord_errors']}",
+            inline=True
+        )
+        
+        # Next check info
+        if signal_check_loop.is_running() and loop_start_time:
+            elapsed = (now - loop_start_time).total_seconds()
+            cycles_completed_since_start = int(elapsed // CHECK_INTERVAL)
+            next_cycle_time = loop_start_time + timedelta(seconds=(cycles_completed_since_start + 1) * CHECK_INTERVAL)
+            time_until_next = next_cycle_time - now
+            
+            if time_until_next.total_seconds() <= 0:
+                time_until_next = timedelta(seconds=CHECK_INTERVAL)
+                next_cycle_time = now + time_until_next
+            
+            minutes, seconds = divmod(int(time_until_next.total_seconds()), 60)
+            time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+            
+            embed.add_field(
+                name="⏳ Next Check", 
+                value=f"**In:** {time_str}\n"
+                      f"**At:** {next_cycle_time.strftime('%I:%M:%S %p EST')}\n"
+                      f"**Interval:** {CHECK_INTERVAL}s",
+                inline=True
+            )
+        
+        # Health issues (if any)
+        if health_issues:
+            embed.add_field(
+                name="⚠️ Issues Detected", 
+                value="\n".join([f"• {issue}" for issue in health_issues]),
+                inline=False
+            )
+        
+        # Configuration summary
+        embed.add_field(
+            name="⚙️ Configuration", 
+            value=f"**Tickers:** {len(TICKERS)}\n"
+                  f"**Timeframes:** {len(TIMEFRAMES)}\n"
+                  f"**Combinations:** {len(TICKER_TF_COMBINATIONS)}",
+            inline=True
+        )
+        
+        # Set footer
+        embed.set_footer(text="💡 Use !status for detailed bot information • !timer for next check countdown")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error generating health report: {str(e)}")
+
+@bot.command(name='uptime')
+async def uptime_command(ctx):
+    """Show bot uptime and Railway deployment info"""
+    try:
+        now = datetime.now(EST)
+        
+        if not bot_start_time:
+            await ctx.send("⚠️ Bot start time not available")
+            return
+            
+        uptime = now - bot_start_time
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        embed = discord.Embed(
+            title="⏰ Bot Uptime",
+            color=0x00ff88,
+            timestamp=now
+        )
+        
+        # Uptime display
+        uptime_parts = []
+        if days > 0:
+            uptime_parts.append(f"{days} day{'s' if days != 1 else ''}")
+        if hours > 0:
+            uptime_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes > 0:
+            uptime_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        if seconds > 0 or not uptime_parts:
+            uptime_parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+        
+        uptime_str = ", ".join(uptime_parts)
+        
+        embed.add_field(
+            name="🕐 Current Uptime",
+            value=f"`{uptime_str}`",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🚀 Started At",
+            value=f"`{bot_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}`",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📅 Current Time",
+            value=f"`{now.strftime('%Y-%m-%d %I:%M:%S %p EST')}`",
+            inline=True
+        )
+        
+        # Railway info
+        if os.getenv('RAILWAY_ENVIRONMENT'):
+            embed.add_field(
+                name="🚂 Railway Deployment",
+                value=f"**Environment:** {os.getenv('RAILWAY_ENVIRONMENT')}\n"
+                      f"**Service:** {os.getenv('RAILWAY_SERVICE_NAME', 'discord-bot')}\n"
+                      f"**Running:** ✅ Active",
+                inline=False
+            )
+        
+        # Loop status
+        loop_status = "✅ Running" if signal_check_loop.is_running() else "❌ Stopped"
+        embed.add_field(
+            name="🔄 Monitoring Status",
+            value=f"**Signal Loop:** {loop_status}\n"
+                  f"**Check Cycles:** {checks_completed}\n"
+                  f"**Last Check:** {last_successful_check.strftime('%I:%M:%S %p EST') if last_successful_check else 'Never'}",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error showing uptime: {str(e)}")
 
 if __name__ == "__main__":
     import asyncio
