@@ -14,6 +14,8 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import pytz
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Load environment variables
 load_dotenv()
@@ -1107,6 +1109,86 @@ class SignalNotifier:
             
         except Exception as e:
             print(f"❌ Error sending notification: {e}")
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for Railway health checks"""
+    
+    def do_GET(self):
+        """Handle GET requests for health check"""
+        try:
+            if self.path == '/health':
+                # Create health status
+                health_data = {
+                    "status": "healthy" if signal_check_loop.is_running() else "unhealthy",
+                    "uptime_seconds": int((datetime.now() - bot_start_time).total_seconds()) if bot_start_time else 0,
+                    "checks_completed": checks_completed,
+                    "last_check": last_successful_check.isoformat() if last_successful_check else None,
+                    "total_signals_found": health_stats.get('total_signals_found', 0),
+                    "total_notifications_sent": health_stats.get('total_notifications_sent', 0),
+                    "failed_checks": health_stats.get('failed_checks', 0),
+                    "api_errors": health_stats.get('api_errors', 0),
+                    "discord_errors": health_stats.get('discord_errors', 0),
+                    "bot_ready": bot.is_ready() if 'bot' in globals() else False,
+                    "loop_running": signal_check_loop.is_running(),
+                    "environment": os.getenv('RAILWAY_ENVIRONMENT', 'local'),
+                    "service": os.getenv('RAILWAY_SERVICE_NAME', 'discord-bot'),
+                    "version": "1.0.0"
+                }
+                
+                # Set response
+                self.send_response(200 if health_data["status"] == "healthy" else 503)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(health_data, indent=2).encode())
+                
+            elif self.path == '/':
+                # Basic root endpoint
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Discord Signal Bot - Health Check Available at /health')
+                
+            else:
+                # 404 for other paths
+                self.send_response(404)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Not Found')
+                
+        except Exception as e:
+            # Error response
+            self.send_response(500)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f'Health check error: {str(e)}'.encode())
+    
+    def log_message(self, format, *args):
+        """Suppress default HTTP server logging to reduce noise"""
+        if os.getenv('RAILWAY_ENVIRONMENT'):
+            # Only log health checks in Railway environment for debugging
+            return
+        else:
+            # Log locally for development
+            super().log_message(format, *args)
+
+def start_health_server():
+    """Start the health check HTTP server in a separate thread"""
+    try:
+        port = int(os.getenv('PORT', '8080'))  # Railway sets PORT automatically
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        
+        print(f"🏥 Health check server starting on port {port}")
+        print(f"🌐 Health endpoint: http://0.0.0.0:{port}/health")
+        
+        # Start server in a separate thread so it doesn't block the bot
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        
+        return server
+    except Exception as e:
+        print(f"⚠️ Failed to start health check server: {e}")
+        print("📝 Bot will continue without health endpoint")
+        return None
 
 # Discord Bot Setup
 intents = discord.Intents.default()
@@ -2372,6 +2454,9 @@ if __name__ == "__main__":
     print(f"📡 Monitoring API: {API_BASE_URL}")
     print(f"💬 Channel ID: {CHANNEL_ID}")
     print(f"⏰ Check interval: {CHECK_INTERVAL} seconds")
+    
+    # Start health check server for Railway monitoring
+    health_server = start_health_server()
     
     try:
         bot.run(DISCORD_TOKEN)
