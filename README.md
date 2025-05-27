@@ -225,4 +225,53 @@ This bot is designed for production use with:
 - ✅ Robust duplicate prevention
 - ✅ Dynamic configuration management
 - ✅ Rich logging and monitoring
-- ✅ Multi-environment deployment support 
+- ✅ Multi-environment deployment support
+
+## Railway Deployment Monitoring
+
+The bot includes comprehensive health monitoring features specifically designed for Railway deployments:
+
+### Health Check Commands
+
+- `!health` - Complete bot health status with Railway info
+- `!uptime` - Show bot uptime and deployment details  
+- `!status` - Basic bot operational status
+- `!timer` - Time until next signal check
+
+### Railway Health Features
+
+- **Automatic Railway Detection**: Detects Railway environment variables
+- **Enhanced Logging**: Detailed logs for Railway console monitoring
+- **Health Alerts**: Automatic Discord notifications for critical errors
+- **Performance Tracking**: Success rates, error counts, uptime stats
+
+### Monitoring Your Railway Deployment
+
+1. **Check Health Status**: Use `!health` to get a comprehensive overview
+2. **Monitor Logs**: Check Railway console for detailed logging
+3. **Verify Timer**: Use `!timer` to ensure signal checks are running
+4. **Track Uptime**: Use `!uptime` to see how long the bot has been running
+
+### Railway Health Check Script
+
+Run the health check script before deployment:
+
+```bash
+python railway_health.py
+```
+
+This verifies:
+- ✅ All required files are present
+- ✅ Environment variables are configured  
+- ✅ API connection is working
+- ✅ Configuration files are valid
+
+### Troubleshooting Railway Issues
+
+If the bot isn't working on Railway:
+
+1. **Check Environment Variables**: Ensure all required vars are set
+2. **Verify API Access**: Make sure your API endpoint is accessible
+3. **Monitor Health**: Use `!health` command to identify issues
+4. **Check Logs**: Review Railway deployment logs for errors
+5. **Test Locally**: Run `railway_health.py` to verify configuration 
