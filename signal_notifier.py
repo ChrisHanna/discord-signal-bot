@@ -1118,9 +1118,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         try:
             if self.path == '/health':
                 # Create health status
+                now_est = datetime.now(EST)  # Use timezone-aware datetime
+                
                 health_data = {
                     "status": "healthy" if signal_check_loop.is_running() else "unhealthy",
-                    "uptime_seconds": int((datetime.now() - bot_start_time).total_seconds()) if bot_start_time else 0,
+                    "uptime_seconds": int((now_est - bot_start_time).total_seconds()) if bot_start_time else 0,
                     "checks_completed": checks_completed,
                     "last_check": last_successful_check.isoformat() if last_successful_check else None,
                     "total_signals_found": health_stats.get('total_signals_found', 0),
