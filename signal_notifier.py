@@ -23,13 +23,69 @@ CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1600'))  # Default ~26 minutes
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 
-# Trading Configuration
-TICKERS_STR = os.getenv('TICKERS', 'AAPL,TSLA,NVDA,SPY,QQQ')
-TICKERS = [ticker.strip().upper() for ticker in TICKERS_STR.split(',') if ticker.strip()]
+# File paths
+LAST_NOTIFICATION_FILE = 'last_notifications.json'
+TICKERS_CONFIG_FILE = 'tickers.json'
 
-# Multiple timeframes support
-TIMEFRAMES_STR = os.getenv('TIMEFRAMES', '1d')
-TIMEFRAMES = [tf.strip() for tf in TIMEFRAMES_STR.split(',') if tf.strip()]
+def load_ticker_config() -> Dict:
+    """Load ticker configuration from JSON file"""
+    try:
+        if os.path.exists(TICKERS_CONFIG_FILE):
+            with open(TICKERS_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        else:
+            # Create default config if file doesn't exist
+            default_config = {
+                "tickers": ["AAPL", "TSLA", "NVDA", "SPY", "QQQ"],
+                "timeframes": ["1d", "1h"],
+                "settings": {
+                    "max_tickers": 50,
+                    "allowed_timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"],
+                    "default_timeframes": ["1d", "1h"]
+                }
+            }
+            save_ticker_config(default_config)
+            return default_config
+    except Exception as e:
+        print(f"❌ Error loading ticker config: {e}")
+        # Return minimal fallback config
+        return {
+            "tickers": ["AAPL", "TSLA"],
+            "timeframes": ["1d"],
+            "settings": {
+                "max_tickers": 50,
+                "allowed_timeframes": ["1d", "1h"],
+                "default_timeframes": ["1d"]
+            }
+        }
+
+def save_ticker_config(config: Dict):
+    """Save ticker configuration to JSON file"""
+    try:
+        temp_file = TICKERS_CONFIG_FILE + '.tmp'
+        with open(temp_file, 'w') as f:
+            json.dump(config, f, indent=4, sort_keys=True)
+        
+        # Atomic move
+        import shutil
+        shutil.move(temp_file, TICKERS_CONFIG_FILE)
+        print(f"💾 Ticker configuration saved successfully")
+    except Exception as e:
+        print(f"❌ Error saving ticker config: {e}")
+
+# Load initial ticker configuration
+ticker_config = load_ticker_config()
+TICKERS = ticker_config.get('tickers', ['AAPL', 'TSLA'])
+TIMEFRAMES = ticker_config.get('timeframes', ['1d'])
+
+# Legacy environment variable support (fallback)
+if not TICKERS:
+    TICKERS_STR = os.getenv('TICKERS', 'AAPL,TSLA,NVDA,SPY,QQQ')
+    TICKERS = [ticker.strip().upper() for ticker in TICKERS_STR.split(',') if ticker.strip()]
+
+if not TIMEFRAMES:
+    TIMEFRAMES_STR = os.getenv('TIMEFRAMES', '1d')
+    TIMEFRAMES = [tf.strip() for tf in TIMEFRAMES_STR.split(',') if tf.strip()]
 
 # Advanced per-ticker timeframes (overrides TIMEFRAMES if set)
 TICKER_TIMEFRAMES_STR = os.getenv('TICKER_TIMEFRAMES', '')
@@ -43,25 +99,28 @@ if TICKER_TIMEFRAMES_STR:
             TICKER_TIMEFRAMES[ticker.strip().upper()] = timeframe.strip()
 
 # Build the final ticker-timeframe combinations
-TICKER_TF_COMBINATIONS = []
-
-if TICKER_TIMEFRAMES:
-    # Use per-ticker timeframes
-    for ticker, timeframe in TICKER_TIMEFRAMES.items():
-        TICKER_TF_COMBINATIONS.append((ticker, timeframe))
-    print(f"📊 Using per-ticker timeframes: {TICKER_TIMEFRAMES}")
-else:
-    # Use simple multi-timeframe (all tickers on all timeframes)
-    for ticker in TICKERS:
-        for timeframe in TIMEFRAMES:
+def build_ticker_combinations():
+    """Build ticker-timeframe combinations from current config"""
+    global TICKER_TF_COMBINATIONS
+    TICKER_TF_COMBINATIONS = []
+    
+    if TICKER_TIMEFRAMES:
+        # Use per-ticker timeframes
+        for ticker, timeframe in TICKER_TIMEFRAMES.items():
             TICKER_TF_COMBINATIONS.append((ticker, timeframe))
-    print(f"📊 Using multi-timeframe: {len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes = {len(TICKER_TF_COMBINATIONS)} combinations")
+        print(f"📊 Using per-ticker timeframes: {TICKER_TIMEFRAMES}")
+    else:
+        # Use simple multi-timeframe (all tickers on all timeframes)
+        for ticker in TICKERS:
+            for timeframe in TIMEFRAMES:
+                TICKER_TF_COMBINATIONS.append((ticker, timeframe))
+        print(f"📊 Using multi-timeframe: {len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes = {len(TICKER_TF_COMBINATIONS)} combinations")
+
+# Initial build
+build_ticker_combinations()
 
 MAX_SIGNAL_AGE_DAYS = int(os.getenv('MAX_SIGNAL_AGE_DAYS', '1'))
 ONLY_STRONG_SIGNALS = os.getenv('ONLY_STRONG_SIGNALS', 'false').lower() == 'true'
-
-# File to store last notification timestamps
-LAST_NOTIFICATION_FILE = 'last_notifications.json'
 
 print(f"📊 Loaded configuration:")
 print(f"   Ticker-Timeframe Combinations: {len(TICKER_TF_COMBINATIONS)}")
@@ -1493,6 +1552,315 @@ async def clear_channel(ctx, limit = None):
         await ctx.send(f"❌ Error deleting messages: {str(e)}")
     except Exception as e:
         await ctx.send(f"❌ Unexpected error: {str(e)}")
+
+@bot.command(name='addticker')
+async def add_ticker_command(ctx, ticker: str):
+    """Add a ticker to the monitoring list"""
+    global TICKERS, TICKER_TF_COMBINATIONS
+    try:
+        ticker = ticker.upper().strip()
+        
+        # Load current config
+        config = load_ticker_config()
+        current_tickers = config.get('tickers', [])
+        max_tickers = config.get('settings', {}).get('max_tickers', 50)
+        
+        # Validation
+        if not ticker:
+            await ctx.send("❌ Please provide a valid ticker symbol")
+            return
+            
+        if ticker in current_tickers:
+            await ctx.send(f"⚠️ **{ticker}** is already being monitored")
+            return
+            
+        if len(current_tickers) >= max_tickers:
+            await ctx.send(f"❌ Maximum ticker limit reached ({max_tickers}). Remove a ticker first.")
+            return
+            
+        # Basic ticker validation (alphanumeric, dash, dot)
+        import re
+        if not re.match(r'^[A-Z0-9.-]+$', ticker):
+            await ctx.send(f"❌ Invalid ticker format: **{ticker}**\nTickers should contain only letters, numbers, dots, and dashes.")
+            return
+            
+        # Add ticker
+        current_tickers.append(ticker)
+        config['tickers'] = sorted(current_tickers)  # Keep sorted
+        save_ticker_config(config)
+        
+        # Update global variables and rebuild combinations
+        TICKERS = config['tickers']
+        build_ticker_combinations()
+        
+        # Create success embed
+        embed = discord.Embed(
+            title="✅ Ticker Added Successfully!",
+            description=f"**{ticker}** has been added to the monitoring list",
+            color=0x00ff00
+        )
+        embed.add_field(
+            name="📊 Current Status", 
+            value=f"Monitoring **{len(TICKERS)}** tickers across **{len(TIMEFRAMES)}** timeframes\n"
+                  f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**",
+            inline=False
+        )
+        embed.add_field(
+            name="🔄 Next Check", 
+            value="The new ticker will be included in the next signal check cycle",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error adding ticker: {str(e)}")
+
+@bot.command(name='removeticker')
+async def remove_ticker_command(ctx, ticker: str):
+    """Remove a ticker from the monitoring list"""
+    global TICKERS, TICKER_TF_COMBINATIONS
+    try:
+        ticker = ticker.upper().strip()
+        
+        # Load current config
+        config = load_ticker_config()
+        current_tickers = config.get('tickers', [])
+        
+        if not ticker:
+            await ctx.send("❌ Please provide a valid ticker symbol")
+            return
+            
+        if ticker not in current_tickers:
+            await ctx.send(f"⚠️ **{ticker}** is not in the monitoring list")
+            return
+            
+        if len(current_tickers) <= 1:
+            await ctx.send("❌ Cannot remove the last ticker. At least one ticker must be monitored.")
+            return
+            
+        # Remove ticker
+        current_tickers.remove(ticker)
+        config['tickers'] = current_tickers
+        save_ticker_config(config)
+        
+        # Update global variables and rebuild combinations
+        TICKERS = config['tickers']
+        build_ticker_combinations()
+        
+        # Create success embed
+        embed = discord.Embed(
+            title="🗑️ Ticker Removed Successfully!",
+            description=f"**{ticker}** has been removed from the monitoring list",
+            color=0xff9900
+        )
+        embed.add_field(
+            name="📊 Current Status", 
+            value=f"Monitoring **{len(TICKERS)}** tickers across **{len(TIMEFRAMES)}** timeframes\n"
+                  f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error removing ticker: {str(e)}")
+
+@bot.command(name='listtickers')
+async def list_tickers_command(ctx):
+    """List all currently monitored tickers"""
+    try:
+        config = load_ticker_config()
+        tickers = config.get('tickers', [])
+        timeframes = config.get('timeframes', ['1d'])
+        max_tickers = config.get('settings', {}).get('max_tickers', 50)
+        
+        # Create embed
+        embed = discord.Embed(
+            title="📊 Current Ticker Configuration",
+            color=0x0099ff
+        )
+        
+        # Tickers field
+        if tickers:
+            ticker_text = ", ".join(f"`{ticker}`" for ticker in tickers)
+            # Split long ticker lists
+            if len(ticker_text) > 1000:
+                ticker_chunks = []
+                current_chunk = ""
+                for ticker in tickers:
+                    ticker_part = f"`{ticker}`, "
+                    if len(current_chunk + ticker_part) > 1000:
+                        ticker_chunks.append(current_chunk.rstrip(", "))
+                        current_chunk = ticker_part
+                    else:
+                        current_chunk += ticker_part
+                if current_chunk:
+                    ticker_chunks.append(current_chunk.rstrip(", "))
+                
+                for i, chunk in enumerate(ticker_chunks):
+                    field_name = "📈 Monitored Tickers" if i == 0 else f"📈 Monitored Tickers (continued {i+1})"
+                    embed.add_field(name=field_name, value=chunk, inline=False)
+            else:
+                embed.add_field(name="📈 Monitored Tickers", value=ticker_text, inline=False)
+        else:
+            embed.add_field(name="📈 Monitored Tickers", value="*None configured*", inline=False)
+            
+        # Timeframes field
+        timeframe_text = ", ".join(f"`{tf}`" for tf in timeframes)
+        embed.add_field(name="⏱️ Timeframes", value=timeframe_text, inline=True)
+        
+        # Statistics
+        embed.add_field(
+            name="📊 Statistics",
+            value=f"**Tickers**: {len(tickers)}/{max_tickers}\n"
+                  f"**Timeframes**: {len(timeframes)}\n"
+                  f"**Total Combinations**: {len(TICKER_TF_COMBINATIONS)}",
+            inline=True
+        )
+        
+        # Commands help
+        embed.add_field(
+            name="🛠️ Management Commands",
+            value="`!addticker SYMBOL` - Add ticker\n"
+                  "`!removeticker SYMBOL` - Remove ticker\n"
+                  "`!timeframes` - Manage timeframes",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error listing tickers: {str(e)}")
+
+@bot.command(name='timeframes')
+async def timeframes_command(ctx, action: str = None, timeframe: str = None):
+    """Manage timeframes: !timeframes list|add|remove [timeframe]"""
+    global TIMEFRAMES, TICKER_TF_COMBINATIONS
+    try:
+        config = load_ticker_config()
+        current_timeframes = config.get('timeframes', ['1d'])
+        allowed_timeframes = config.get('settings', {}).get('allowed_timeframes', ['1d', '1h'])
+        
+        if not action:
+            action = 'list'
+            
+        action = action.lower()
+        
+        if action == 'list':
+            embed = discord.Embed(
+                title="⏱️ Timeframe Configuration",
+                color=0x0099ff
+            )
+            
+            # Current timeframes
+            tf_text = ", ".join(f"`{tf}`" for tf in current_timeframes)
+            embed.add_field(name="📊 Active Timeframes", value=tf_text, inline=False)
+            
+            # Available timeframes
+            available_text = ", ".join(f"`{tf}`" for tf in allowed_timeframes)
+            embed.add_field(name="✅ Available Timeframes", value=available_text, inline=False)
+            
+            # Statistics
+            embed.add_field(
+                name="📈 Impact",
+                value=f"**Tickers**: {len(TICKERS)}\n"
+                      f"**Timeframes**: {len(current_timeframes)}\n"
+                      f"**Total Combinations**: {len(TICKER_TF_COMBINATIONS)}",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="🛠️ Commands",
+                value="`!timeframes add 1h` - Add timeframe\n"
+                      "`!timeframes remove 1h` - Remove timeframe",
+                inline=False
+            )
+            
+            await ctx.send(embed=embed)
+            
+        elif action == 'add':
+            if not timeframe:
+                await ctx.send("❌ Please specify a timeframe to add\nExample: `!timeframes add 1h`")
+                return
+                
+            timeframe = timeframe.lower()
+            
+            if timeframe not in allowed_timeframes:
+                await ctx.send(f"❌ **{timeframe}** is not a supported timeframe\n"
+                              f"Available: {', '.join(allowed_timeframes)}")
+                return
+                
+            if timeframe in current_timeframes:
+                await ctx.send(f"⚠️ **{timeframe}** is already active")
+                return
+                
+            # Add timeframe
+            current_timeframes.append(timeframe)
+            config['timeframes'] = current_timeframes
+            save_ticker_config(config)
+            
+            # Update globals
+            TIMEFRAMES = current_timeframes
+            build_ticker_combinations()
+            
+            embed = discord.Embed(
+                title="✅ Timeframe Added!",
+                description=f"**{timeframe}** has been added to active timeframes",
+                color=0x00ff00
+            )
+            embed.add_field(
+                name="📊 New Status",
+                value=f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
+                      f"({len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes)",
+                inline=False
+            )
+            
+            await ctx.send(embed=embed)
+            
+        elif action == 'remove':
+            if not timeframe:
+                await ctx.send("❌ Please specify a timeframe to remove\nExample: `!timeframes remove 1h`")
+                return
+                
+            timeframe = timeframe.lower()
+            
+            if timeframe not in current_timeframes:
+                await ctx.send(f"⚠️ **{timeframe}** is not currently active")
+                return
+                
+            if len(current_timeframes) <= 1:
+                await ctx.send("❌ Cannot remove the last timeframe. At least one must be active.")
+                return
+                
+            # Remove timeframe
+            current_timeframes.remove(timeframe)
+            config['timeframes'] = current_timeframes
+            save_ticker_config(config)
+            
+            # Update globals
+            TIMEFRAMES = current_timeframes
+            build_ticker_combinations()
+            
+            embed = discord.Embed(
+                title="🗑️ Timeframe Removed!",
+                description=f"**{timeframe}** has been removed from active timeframes",
+                color=0xff9900
+            )
+            embed.add_field(
+                name="📊 New Status",
+                value=f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
+                      f"({len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes)",
+                inline=False
+            )
+            
+            await ctx.send(embed=embed)
+            
+        else:
+            await ctx.send("❌ Invalid action. Use: `!timeframes list|add|remove [timeframe]`")
+            
+    except Exception as e:
+        await ctx.send(f"❌ Error managing timeframes: {str(e)}")
 
 if __name__ == "__main__":
     import asyncio

@@ -39,6 +39,7 @@ ENV/
 
 # Discord bot specific
 last_notifications.json
+tickers.json
 *.log
 
 # OS
