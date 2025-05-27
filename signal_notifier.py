@@ -13,6 +13,7 @@ from typing import List, Dict, Optional
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+import pytz
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +27,83 @@ CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 # File paths
 LAST_NOTIFICATION_FILE = 'last_notifications.json'
 TICKERS_CONFIG_FILE = 'tickers.json'
+
+# Timezone setup
+EST = pytz.timezone('US/Eastern')
+
+def convert_to_est(dt: datetime) -> datetime:
+    """Convert datetime to EST timezone"""
+    if dt.tzinfo is None:
+        # Assume UTC if no timezone info
+        dt = pytz.UTC.localize(dt)
+    return dt.astimezone(EST)
+
+def format_est_timestamp(timestamp_str: str, show_time: bool = True) -> str:
+    """Format timestamp string to EST with readable format"""
+    if not timestamp_str:
+        return "N/A"
+    
+    try:
+        # Parse the timestamp
+        if ' ' in timestamp_str:
+            # Full timestamp (e.g., "2025-01-27 09:30:00")
+            dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+        else:
+            # Date only (e.g., "2025-01-27")
+            dt = datetime.strptime(timestamp_str, '%Y-%m-%d')
+            # Assume market open time (9:30 AM EST) for date-only signals
+            dt = dt.replace(hour=9, minute=30)
+        
+        # Convert to EST
+        dt_est = convert_to_est(dt)
+        
+        if show_time and ' ' in timestamp_str:
+            # Show full timestamp with timezone
+            return dt_est.strftime('%Y-%m-%d %I:%M:%S %p EST')
+        else:
+            # Show date only
+            return dt_est.strftime('%Y-%m-%d EST')
+            
+    except (ValueError, TypeError) as e:
+        print(f"⚠️ Error formatting timestamp '{timestamp_str}': {e}")
+        return timestamp_str
+
+def calculate_time_ago_est(timestamp_str: str) -> str:
+    """Calculate how long ago a signal occurred in EST-friendly format"""
+    if not timestamp_str:
+        return "Unknown"
+    
+    try:
+        # Parse the timestamp
+        if ' ' in timestamp_str:
+            dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+        else:
+            dt = datetime.strptime(timestamp_str, '%Y-%m-%d')
+            dt = dt.replace(hour=9, minute=30)  # Assume market open
+        
+        # Convert both to EST for comparison
+        dt_est = convert_to_est(dt)
+        now_est = datetime.now(EST)
+        
+        # Calculate difference
+        time_diff = now_est - dt_est
+        
+        if time_diff.days > 0:
+            return f"{time_diff.days} day{'s' if time_diff.days != 1 else ''} ago"
+        else:
+            hours = time_diff.seconds // 3600
+            minutes = (time_diff.seconds % 3600) // 60
+            
+            if hours > 0:
+                return f"{hours}h {minutes}m ago"
+            elif minutes > 0:
+                return f"{minutes}m ago"
+            else:
+                return "Just now"
+                
+    except (ValueError, TypeError) as e:
+        print(f"⚠️ Error calculating time ago for '{timestamp_str}': {e}")
+        return "Unknown"
 
 def load_ticker_config() -> Dict:
     """Load ticker configuration from JSON file"""
@@ -867,7 +945,7 @@ class SignalNotifier:
         return False
     
     def format_signal_for_discord(self, signal: Dict, ticker: str, timeframe: str = '1d') -> str:
-        """Format a signal for Discord notification"""
+        """Format a signal for Discord notification with EST timestamps"""
         # Get emoji based on signal type
         emoji = {
             'WT Buy Signal': '📈',
@@ -889,28 +967,33 @@ class SignalNotifier:
             'Weak': '💧'
         }.get(signal.get('strength', ''), '')
         
-        # Format timing
-        days_since = signal.get('daysSince', 0)
-        timing = f"{days_since} day{'s' if days_since != 1 else ''} ago"
-        if days_since == 0:
-            timing = "TODAY ⚡"
-        
-        # Format timestamp - show full timestamp when available
+        # Get signal date and format timing in EST
         signal_date = signal.get('date', '')
+        
+        # Calculate EST-based timing
+        timing_est = calculate_time_ago_est(signal_date)
+        
+        # Format timestamp in EST
         if ' ' in signal_date:
             # Full timestamp available (e.g., "2025-05-27 09:30:00")
-            timestamp_display = signal_date
-            time_info = "🕐 **Full Timestamp:** "
+            timestamp_display = format_est_timestamp(signal_date, show_time=True)
+            time_info = "🕐 **EST Time:** "
         else:
             # Only date available (e.g., "2025-05-27")
-            timestamp_display = signal_date
-            time_info = "📅 **Date:** "
+            timestamp_display = format_est_timestamp(signal_date, show_time=False)
+            time_info = "📅 **EST Date:** "
+        
+        # Add special indicator for very recent signals
+        if timing_est == "Just now":
+            timing_est = "Just now ⚡"
+        elif "ago" in timing_est and ("m ago" in timing_est or "h ago" in timing_est):
+            timing_est = f"{timing_est} ⚡"
         
         return f"""
 {emoji} **{ticker}** - {signal.get('type', 'Unknown')} {strength_indicator}
 📊 **System:** {signal.get('system', 'Unknown')}
 ⏰ **Timeframe:** {timeframe}
-🕐 **Timing:** {timing}
+🕐 **Timing:** {timing_est}
 {time_info}{timestamp_display}
         """.strip()
 
@@ -943,7 +1026,7 @@ class SignalNotifier:
                 title=f"🚨 Signal Alert: {ticker} ({timeframe})",
                 description=message,
                 color=color,
-                timestamp=datetime.now()
+                timestamp=datetime.now(EST)
             )
             
             # Add system and strength as fields
@@ -1111,7 +1194,7 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
         embed = discord.Embed(
             title=f"📊 Recent Signals for {ticker.upper()} ({timeframe})",
             color=0x0099ff,
-            timestamp=datetime.now()
+            timestamp=datetime.now(EST)
         )
         
         # Add summary information
@@ -1122,29 +1205,17 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
         )
         
         for i, signal in enumerate(recent_signals, 1):
-            days_since = signal.get('daysSince', 0)
-            
-            # Better timing display based on timeframe
-            if timeframe == '1h':
-                if days_since == 0:
-                    timing = "Today ⚡"
-                elif days_since == 1:
-                    timing = "Yesterday"
-                else:
-                    timing = f"{days_since} days ago"
-            else:
-                timing = f"{days_since} day{'s' if days_since != 1 else ''} ago"
-                if days_since == 0:
-                    timing = "Today ⚡"
-            
-            # Format timestamp display
+            # Calculate EST-based timing
             signal_date = signal.get('date', '')
+            timing_est = calculate_time_ago_est(signal_date)
+            
+            # Format timestamp display in EST
             if ' ' in signal_date:
                 # Full timestamp with time (common for 1h data)
-                date_display = f"🕐 {signal_date}"
+                date_display = f"🕐 {format_est_timestamp(signal_date, show_time=True)}"
             else:
                 # Date only (common for 1d data)
-                date_display = f"📅 {signal_date}"
+                date_display = f"📅 {format_est_timestamp(signal_date, show_time=False)}"
             
             # Add strength indicator
             strength = signal.get('strength', '')
@@ -1157,7 +1228,7 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
             
             embed.add_field(
                 name=f"{i}. {signal.get('type', 'Unknown')} {strength_emoji}",
-                value=f"**System:** {signal.get('system', 'Unknown')}\n**Strength:** {strength}\n⏰ {timing}\n{date_display}",
+                value=f"**System:** {signal.get('system', 'Unknown')}\n**Strength:** {strength}\n⏰ {timing_est}\n{date_display}",
                 inline=True
             )
         
@@ -1197,7 +1268,7 @@ async def show_timer(ctx):
         embed = discord.Embed(
             title="⏰ Signal Check Timer",
             color=0x00ff88,
-            timestamp=datetime.now()
+            timestamp=datetime.now(EST)
         )
         
         if hours > 0:
@@ -1208,7 +1279,7 @@ async def show_timer(ctx):
             time_str = f"{seconds}s"
         
         embed.add_field(name="⏳ Time Until Next Check", value=f"`{time_str}`", inline=True)
-        embed.add_field(name="🕐 Next Check At", value=f"`{next_cycle_time.strftime('%H:%M:%S')}`", inline=True)
+        embed.add_field(name="🕐 Next Check At (EST)", value=f"`{next_cycle_time.astimezone(EST).strftime('%I:%M:%S %p')}`", inline=True)
         embed.add_field(name="🔄 Check Interval", value=f"`{CHECK_INTERVAL} seconds`", inline=True)
         
         # Progress bar
@@ -1280,7 +1351,7 @@ async def show_config(ctx):
     embed = discord.Embed(
         title="⚙️ Bot Configuration",
         color=0x00ff88,
-        timestamp=datetime.now()
+        timestamp=datetime.now(EST)
     )
     
     # Show ticker-timeframe combinations
@@ -1341,7 +1412,7 @@ async def notification_stats(ctx):
     embed = discord.Embed(
         title="📊 Notification Statistics",
         color=0x00ff88,
-        timestamp=datetime.now()
+        timestamp=datetime.now(EST)
     )
     
     embed.add_field(name="📝 Total Entries", value=f"`{total_entries}`", inline=True)
@@ -1381,7 +1452,7 @@ async def manual_cleanup(ctx):
     embed = discord.Embed(
         title="🧹 Notification Cleanup Complete",
         color=0x00ff00,
-        timestamp=datetime.now()
+        timestamp=datetime.now(EST)
     )
     
     embed.add_field(name="📊 Before", value=f"`{before_count} entries`", inline=True)
