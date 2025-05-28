@@ -3900,6 +3900,7 @@ async def help_command(ctx):
 `!addticker SYMBOL` - Add ticker to watchlist
 `!removeticker SYMBOL` - Remove ticker from watchlist
 `!listtickers` - List all monitored tickers
+`!tickersync` - Sync bot with database tickers (loads from PostgreSQL)
 `!timeframes [ACTION] [TF]` - Manage timeframes
 `!dbsync` - Database synchronization status
         """,
