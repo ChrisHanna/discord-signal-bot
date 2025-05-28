@@ -1,35 +1,170 @@
 #!/usr/bin/env python3
 """
 Priority Management System for Discord Signal Bot
-Handles priority scoring, filtering, and ranking of trading signals.
+Manages signal priority scoring and filtering with database-backed configuration
 """
 
 import os
+import re
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import re
+from typing import Dict, List, Set, Tuple
 
-class SignalPriority(Enum):
-    """Signal priority levels"""
-    CRITICAL = 5      # Must notify immediately
-    HIGH = 4          # Very important signals
-    MEDIUM = 3        # Standard importance
-    LOW = 2           # Less important
-    MINIMAL = 1       # Only for completeness
+# ✅ NEW: Database-first priority configuration
+class DatabasePriorityConfig:
+    """Manage priority configuration using PostgreSQL database as single source of truth"""
+    
+    def __init__(self):
+        # Default values (used if database is unavailable)
+        self.config_name = 'default'
+        self.min_priority_level = 'MEDIUM'
+        self.critical_threshold = 90
+        self.high_threshold = 70
+        self.medium_threshold = 50
+        self.low_threshold = 30
+        self.vip_tickers = set(['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA'])
+        self.vip_timeframes = set(['1d', '4h'])
+        
+    async def load_from_database(self, config_name: str = 'default') -> bool:
+        """Load priority configuration from PostgreSQL database"""
+        try:
+            from database import db_manager
+            
+            print(f"🎯 Loading priority configuration from database: {config_name}")
+            
+            async with db_manager.pool.acquire() as conn:
+                config_row = await conn.fetchrow('''
+                    SELECT * FROM priority_config 
+                    WHERE config_name = $1 AND is_active = true
+                ''', config_name)
+                
+                if config_row:
+                    # Load from database
+                    self.config_name = config_row['config_name']
+                    self.min_priority_level = config_row['min_priority_level']
+                    self.critical_threshold = config_row['critical_threshold']
+                    self.high_threshold = config_row['high_threshold']
+                    self.medium_threshold = config_row['medium_threshold']
+                    self.low_threshold = config_row['low_threshold']
+                    
+                    # Convert database arrays to sets
+                    self.vip_tickers = set(config_row['vip_tickers'] or [])
+                    self.vip_timeframes = set(config_row['vip_timeframes'] or [])
+                    
+                    print(f"✅ Loaded priority config from database:")
+                    print(f"   Min Priority Level: {self.min_priority_level}")
+                    print(f"   VIP Tickers: {sorted(self.vip_tickers)}")
+                    print(f"   VIP Timeframes: {sorted(self.vip_timeframes)}")
+                    return True
+                else:
+                    # Create default configuration in database
+                    print(f"📊 Creating default priority configuration in database")
+                    await self.save_to_database()
+                    return True
+                    
+        except Exception as e:
+            print(f"❌ Error loading priority config from database: {e}")
+            self.load_from_environment()
+            return False
+    
+    def load_from_environment(self):
+        """Fallback: Load configuration from environment variables"""
+        print("⚠️ Falling back to environment variable priority configuration")
+        
+        # Load thresholds from environment
+        self.critical_threshold = int(os.getenv('PRIORITY_CRITICAL_THRESHOLD', '90'))
+        self.high_threshold = int(os.getenv('PRIORITY_HIGH_THRESHOLD', '70'))
+        self.medium_threshold = int(os.getenv('PRIORITY_MEDIUM_THRESHOLD', '50'))
+        self.low_threshold = int(os.getenv('PRIORITY_LOW_THRESHOLD', '30'))
+        
+        # Minimum priority level to send notifications
+        self.min_priority_level = os.getenv('MIN_PRIORITY_LEVEL', 'MEDIUM')
+        
+        # Load VIP tickers from environment
+        env_vip_tickers = os.getenv('VIP_TICKERS', 'SPY,QQQ,AAPL,TSLA,NVDA').split(',')
+        self.vip_tickers = set(ticker.strip().upper() for ticker in env_vip_tickers if ticker.strip())
+        
+        # Load VIP timeframes from environment
+        env_vip_timeframes = os.getenv('VIP_TIMEFRAMES', '1d,4h').split(',')
+        self.vip_timeframes = set(tf.strip() for tf in env_vip_timeframes if tf.strip())
+        
+        print(f"📊 Loaded from environment: {len(self.vip_tickers)} VIP tickers, {len(self.vip_timeframes)} VIP timeframes")
+    
+    async def save_to_database(self, config_name: str = None) -> bool:
+        """Save current configuration to database"""
+        try:
+            from database import db_manager
+            
+            config_name = config_name or self.config_name
+            
+            async with db_manager.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO priority_config 
+                    (config_name, min_priority_level, critical_threshold, high_threshold,
+                     medium_threshold, low_threshold, vip_tickers, vip_timeframes)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (config_name)
+                    DO UPDATE SET
+                        min_priority_level = EXCLUDED.min_priority_level,
+                        critical_threshold = EXCLUDED.critical_threshold,
+                        high_threshold = EXCLUDED.high_threshold,
+                        medium_threshold = EXCLUDED.medium_threshold,
+                        low_threshold = EXCLUDED.low_threshold,
+                        vip_tickers = EXCLUDED.vip_tickers,
+                        vip_timeframes = EXCLUDED.vip_timeframes,
+                        updated_at = NOW()
+                ''', config_name, self.min_priority_level, self.critical_threshold,
+                     self.high_threshold, self.medium_threshold, self.low_threshold,
+                     list(self.vip_tickers), list(self.vip_timeframes))
+                
+                print(f"💾 Saved priority configuration to database: {config_name}")
+                return True
+                
+        except Exception as e:
+            print(f"❌ Error saving priority config to database: {e}")
+            return False
+    
+    async def add_vip_ticker(self, ticker: str) -> bool:
+        """Add VIP ticker and save to database"""
+        ticker = ticker.upper().strip()
+        if ticker not in self.vip_tickers:
+            self.vip_tickers.add(ticker)
+            return await self.save_to_database()
+        return True
+    
+    async def remove_vip_ticker(self, ticker: str) -> bool:
+        """Remove VIP ticker and save to database"""
+        ticker = ticker.upper().strip()
+        if ticker in self.vip_tickers:
+            self.vip_tickers.discard(ticker)
+            return await self.save_to_database()
+        return True
+    
+    async def set_min_priority_level(self, level: str) -> bool:
+        """Set minimum priority level and save to database"""
+        valid_levels = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'MINIMAL']
+        if level.upper() in valid_levels:
+            self.min_priority_level = level.upper()
+            return await self.save_to_database()
+        return False
 
-class SignalUrgency(Enum):
-    """Signal urgency based on timing"""
-    IMMEDIATE = 5     # Real-time/just happened
-    RECENT = 4        # Within last hour
-    CURRENT = 3       # Within last 4 hours
-    STALE = 2         # Within last day
-    OLD = 1           # Older than a day
+class PriorityLevel(Enum):
+    MINIMAL = 1
+    LOW = 2
+    MEDIUM = 3
+    HIGH = 4
+    CRITICAL = 5
+
+class Urgency(Enum):
+    ANCIENT = 0    # More than 1 day old
+    OLD = 1        # 4-24 hours old
+    MODERATE = 2   # 1-4 hours old
+    RECENT = 3     # 15 minutes - 1 hour old
+    IMMEDIATE = 4  # Within 15 minutes
 
 @dataclass
 class PriorityScore:
-    """Priority scoring breakdown"""
     base_score: int
     strength_bonus: int
     system_bonus: int
@@ -38,37 +173,14 @@ class PriorityScore:
     urgency_bonus: int
     pattern_bonus: int
     total_score: int
-    priority_level: SignalPriority
+    priority_level: PriorityLevel
 
 class SignalPriorityManager:
-    """Manages signal priority scoring and filtering"""
+    """Manages signal priority scoring and filtering using database configuration"""
     
     def __init__(self):
-        self.load_priority_config()
-    
-    def load_priority_config(self):
-        """Load priority configuration from environment variables and database"""
-        print("🎯 Loading priority configuration...")
-        
-        # Load thresholds from environment
-        self.CRITICAL_THRESHOLD = int(os.getenv('PRIORITY_CRITICAL_THRESHOLD', '90'))
-        self.HIGH_THRESHOLD = int(os.getenv('PRIORITY_HIGH_THRESHOLD', '70'))
-        self.MEDIUM_THRESHOLD = int(os.getenv('PRIORITY_MEDIUM_THRESHOLD', '50'))
-        self.LOW_THRESHOLD = int(os.getenv('PRIORITY_LOW_THRESHOLD', '30'))
-        
-        # Minimum priority level to send notifications
-        self.MIN_PRIORITY_LEVEL = os.getenv('MIN_PRIORITY_LEVEL', 'MEDIUM')
-        
-        # Initialize VIP tickers from environment (will be updated from database later)
-        env_vip_tickers = os.getenv('VIP_TICKERS', 'SPY,QQQ,AAPL,TSLA,NVDA').split(',')
-        self.VIP_TICKERS = set(ticker.strip().upper() for ticker in env_vip_tickers if ticker.strip())
-        
-        # High-priority timeframes
-        env_vip_timeframes = os.getenv('VIP_TIMEFRAMES', '1d,4h').split(',')
-        self.VIP_TIMEFRAMES = set(tf.strip() for tf in env_vip_timeframes if tf.strip())
-        
-        print(f"   Environment VIP Tickers: {sorted(self.VIP_TICKERS)}")
-        print(f"   Environment VIP Timeframes: {sorted(self.VIP_TIMEFRAMES)}")
+        # ✅ NEW: Use database-backed configuration
+        self.db_config = DatabasePriorityConfig()
         
         # System priority weights
         self.SYSTEM_WEIGHTS = {
@@ -82,98 +194,107 @@ class SignalPriorityManager:
             'Default': 5
         }
         
-        # Signal strength weights
+        # Strength multipliers
         self.STRENGTH_WEIGHTS = {
             'Very Strong': 25,
             'Strong': 20,
-            'Moderate': 15,
-            'Medium': 10,
-            'Weak': 5,
-            'Unknown': 0
+            'Moderate': 10,
+            'Weak': 5
         }
         
-        # Signal type patterns and their importance
+        # Signal pattern bonuses
         self.SIGNAL_PATTERNS = {
-            # Critical patterns
-            'Gold Buy Signal': 30,
-            'Zero Line Reject': 25,
-            'Extreme Oversold': 25,
-            'Extreme Overbought': 25,
-            
-            # High importance patterns
-            'Fast Money': 20,
-            'Bullish Divergence': 18,
-            'Bearish Divergence': 18,
-            'Hidden.*Divergence': 15,
-            
-            # Medium importance
-            'WT.*Signal': 12,
-            'RSI3M3.*Entry': 12,
-            'Trend Break': 10,
-            
-            # Lower importance
-            'Cross': 8,
-            'Reversal': 6
+            r'gold|extreme': 30,      # Gold signals, extreme conditions
+            r'fast money': 25,        # Fast Money patterns
+            r'divergence': 20,        # Divergence signals
+            r'breakout|breakdown': 15, # Price breakouts/breakdowns
+            r'reversal': 12,          # Reversal patterns
+            r'cross': 8               # Simple crosses
         }
     
-    async def sync_with_database(self):
-        """Sync VIP tickers and settings with PostgreSQL database"""
-        try:
-            # Import here to avoid circular imports
-            from database import get_vip_tickers_from_database, save_vip_tickers_to_database
-            
-            # Get VIP tickers from database
-            db_vip_tickers = await get_vip_tickers_from_database()
-            
-            if db_vip_tickers:
-                # Update from database
-                self.VIP_TICKERS = set(ticker.strip().upper() for ticker in db_vip_tickers if ticker.strip())
-                print(f"✅ Loaded VIP tickers from database: {sorted(self.VIP_TICKERS)}")
-            else:
-                # Save current environment config to database
-                current_vip_list = list(self.VIP_TICKERS)
-                success = await save_vip_tickers_to_database(current_vip_list)
-                if success:
-                    print(f"💾 Saved environment VIP tickers to database: {sorted(self.VIP_TICKERS)}")
-                else:
-                    print(f"⚠️ Failed to save VIP tickers to database")
-                    
-        except Exception as e:
-            print(f"⚠️ Error syncing with database: {e}")
-            print(f"📋 Using environment VIP tickers: {sorted(self.VIP_TICKERS)}")
-
-    def update_vip_tickers(self, vip_tickers: set):
-        """Update VIP tickers in memory"""
-        self.VIP_TICKERS = vip_tickers
-        print(f"🔄 Updated VIP tickers: {sorted(self.VIP_TICKERS)}")
+    async def initialize(self):
+        """Initialize priority manager with database configuration"""
+        success = await self.db_config.load_from_database()
+        if success:
+            print("✅ Priority manager initialized with database configuration")
+        else:
+            print("⚠️ Priority manager initialized with environment fallback")
+        return success
     
-    def calculate_urgency(self, signal_date: str) -> SignalUrgency:
-        """Calculate signal urgency based on timing"""
+    # ✅ NEW: Properties that reference database config
+    @property
+    def CRITICAL_THRESHOLD(self) -> int:
+        return self.db_config.critical_threshold
+    
+    @property 
+    def HIGH_THRESHOLD(self) -> int:
+        return self.db_config.high_threshold
+    
+    @property
+    def MEDIUM_THRESHOLD(self) -> int:
+        return self.db_config.medium_threshold
+    
+    @property
+    def LOW_THRESHOLD(self) -> int:
+        return self.db_config.low_threshold
+    
+    @property
+    def MIN_PRIORITY_LEVEL(self) -> str:
+        return self.db_config.min_priority_level
+    
+    @property
+    def VIP_TICKERS(self) -> Set[str]:
+        return self.db_config.vip_tickers
+    
+    @property
+    def VIP_TIMEFRAMES(self) -> Set[str]:
+        return self.db_config.vip_timeframes
+    
+    # ✅ SIMPLIFIED: Database management methods
+    async def add_vip_ticker(self, ticker: str) -> bool:
+        """Add VIP ticker"""
+        return await self.db_config.add_vip_ticker(ticker)
+    
+    async def remove_vip_ticker(self, ticker: str) -> bool:
+        """Remove VIP ticker"""
+        return await self.db_config.remove_vip_ticker(ticker)
+    
+    async def set_min_priority_level(self, level: str) -> bool:
+        """Set minimum priority level"""
+        return await self.db_config.set_min_priority_level(level)
+    
+    async def reload_from_database(self) -> bool:
+        """Reload configuration from database"""
+        return await self.db_config.load_from_database()
+    
+    def calculate_urgency(self, signal_date: str) -> Urgency:
+        """Calculate urgency based on signal date"""
+        if not signal_date:
+            return Urgency.ANCIENT
+        
         try:
             if ' ' in signal_date:
-                signal_datetime = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
+                signal_time = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
             else:
-                signal_datetime = datetime.strptime(signal_date, '%Y-%m-%d')
-                # Assume market open time for date-only signals
-                signal_datetime = signal_datetime.replace(hour=9, minute=30)
+                signal_time = datetime.strptime(signal_date, '%Y-%m-%d')
             
-            now = datetime.now()
-            time_diff = now - signal_datetime
+            time_diff = datetime.now() - signal_time
+            hours_ago = time_diff.total_seconds() / 3600
             
-            if time_diff.total_seconds() < 300:  # 5 minutes
-                return SignalUrgency.IMMEDIATE
-            elif time_diff.total_seconds() < 3600:  # 1 hour
-                return SignalUrgency.RECENT
-            elif time_diff.total_seconds() < 14400:  # 4 hours
-                return SignalUrgency.CURRENT
-            elif time_diff.total_seconds() < 86400:  # 24 hours
-                return SignalUrgency.STALE
-            else:
-                return SignalUrgency.OLD
+            if hours_ago <= 0.25:      # Within 15 minutes
+                return Urgency.IMMEDIATE
+            elif hours_ago <= 1:       # Within 1 hour
+                return Urgency.RECENT
+            elif hours_ago <= 4:       # Within 4 hours
+                return Urgency.MODERATE
+            elif hours_ago <= 24:      # Within 24 hours
+                return Urgency.OLD
+            else:                      # More than 24 hours
+                return Urgency.ANCIENT
                 
-        except Exception:
-            return SignalUrgency.STALE
-    
+        except (ValueError, TypeError):
+            return Urgency.ANCIENT
+
     def calculate_priority_score(self, signal: Dict, ticker: str, timeframe: str) -> PriorityScore:
         """Calculate comprehensive priority score for a signal"""
         
@@ -217,15 +338,15 @@ class SignalPriorityManager:
         
         # Determine priority level
         if total_score >= self.CRITICAL_THRESHOLD:
-            priority_level = SignalPriority.CRITICAL
+            priority_level = PriorityLevel.CRITICAL
         elif total_score >= self.HIGH_THRESHOLD:
-            priority_level = SignalPriority.HIGH
+            priority_level = PriorityLevel.HIGH
         elif total_score >= self.MEDIUM_THRESHOLD:
-            priority_level = SignalPriority.MEDIUM
+            priority_level = PriorityLevel.MEDIUM
         elif total_score >= self.LOW_THRESHOLD:
-            priority_level = SignalPriority.LOW
+            priority_level = PriorityLevel.LOW
         else:
-            priority_level = SignalPriority.MINIMAL
+            priority_level = PriorityLevel.MINIMAL
         
         return PriorityScore(
             base_score=base_score,
@@ -239,37 +360,34 @@ class SignalPriorityManager:
             priority_level=priority_level
         )
     
-    def should_notify(self, signal: Dict, ticker: str, timeframe: str) -> Tuple[bool, PriorityScore]:
-        """Determine if signal should trigger notification based on priority"""
+    def should_send_notification(self, signal: Dict, ticker: str, timeframe: str) -> Tuple[bool, PriorityScore]:
+        """Determine if a signal meets notification criteria"""
         priority_score = self.calculate_priority_score(signal, ticker, timeframe)
         
         # Check against minimum priority level
-        min_priority = getattr(SignalPriority, self.MIN_PRIORITY_LEVEL, SignalPriority.MEDIUM)
+        min_priority = getattr(PriorityLevel, self.MIN_PRIORITY_LEVEL, PriorityLevel.MEDIUM)
         should_send = priority_score.priority_level.value >= min_priority.value
         
         return should_send, priority_score
     
-    def rank_signals(self, signals: List[Tuple[Dict, str, str]]) -> List[Tuple[Dict, str, str, PriorityScore]]:
-        """Rank signals by priority score (highest first)"""
+    def rank_signals_by_priority(self, signals: List[Tuple[Dict, str, str]]) -> List[Tuple[Dict, str, str, PriorityScore]]:
+        """Rank signals by priority score"""
         scored_signals = []
-        
         for signal, ticker, timeframe in signals:
             priority_score = self.calculate_priority_score(signal, ticker, timeframe)
             scored_signals.append((signal, ticker, timeframe, priority_score))
         
-        # Sort by total score (descending)
+        # Sort by total score (highest first)
         scored_signals.sort(key=lambda x: x[3].total_score, reverse=True)
-        
         return scored_signals
     
     def filter_by_priority(self, signals: List[Tuple[Dict, str, str]], 
-                          min_priority: SignalPriority = None) -> List[Tuple[Dict, str, str, PriorityScore]]:
+                          min_priority: PriorityLevel = None) -> List[Tuple[Dict, str, str, PriorityScore]]:
         """Filter signals by minimum priority level"""
         if min_priority is None:
-            min_priority = getattr(SignalPriority, self.MIN_PRIORITY_LEVEL, SignalPriority.MEDIUM)
+            min_priority = getattr(PriorityLevel, self.MIN_PRIORITY_LEVEL, PriorityLevel.MEDIUM)
         
         filtered_signals = []
-        
         for signal, ticker, timeframe in signals:
             priority_score = self.calculate_priority_score(signal, ticker, timeframe)
             if priority_score.priority_level.value >= min_priority.value:
@@ -279,68 +397,70 @@ class SignalPriorityManager:
     
     def get_priority_summary(self, signals: List[Tuple[Dict, str, str]]) -> Dict:
         """Get summary of signal priorities"""
-        priority_counts = {level.name: 0 for level in SignalPriority}
+        priority_counts = {level.name: 0 for level in PriorityLevel}
         total_signals = len(signals)
-        
-        if total_signals == 0:
-            return priority_counts
         
         for signal, ticker, timeframe in signals:
             priority_score = self.calculate_priority_score(signal, ticker, timeframe)
             priority_counts[priority_score.priority_level.name] += 1
         
-        # Add percentages
-        for level in priority_counts:
-            count = priority_counts[level]
-            priority_counts[f"{level}_PCT"] = round((count / total_signals) * 100, 1) if total_signals > 0 else 0
-        
-        return priority_counts
+        return {
+            'total_signals': total_signals,
+            'priority_breakdown': priority_counts,
+            'critical_signals': priority_counts['CRITICAL'],
+            'high_signals': priority_counts['HIGH'],
+            'medium_signals': priority_counts['MEDIUM'],
+            'low_signals': priority_counts['LOW'],
+            'minimal_signals': priority_counts['MINIMAL']
+        }
     
-    def format_priority_for_discord(self, priority_score: PriorityScore) -> str:
+    def get_priority_display(self, priority_score: PriorityScore) -> str:
         """Format priority information for Discord display"""
         priority_emojis = {
-            SignalPriority.CRITICAL: '🚨🔥',
-            SignalPriority.HIGH: '⚠️🔥',
-            SignalPriority.MEDIUM: '📊⭐',
-            SignalPriority.LOW: '📢💙',
-            SignalPriority.MINIMAL: '📝💚'
+            PriorityLevel.CRITICAL: '🚨🔥',
+            PriorityLevel.HIGH: '⚠️🔥',
+            PriorityLevel.MEDIUM: '📊⭐',
+            PriorityLevel.LOW: '📢💙',
+            PriorityLevel.MINIMAL: '📝💚'
         }
         
         emoji = priority_emojis.get(priority_score.priority_level, '📊')
         
-        return f"{emoji} **Priority:** {priority_score.priority_level.name} ({priority_score.total_score})"
+        return f"\n{emoji} **Priority: {priority_score.priority_level.name}** (Score: {priority_score.total_score})"
     
     def get_debug_breakdown(self, priority_score: PriorityScore) -> str:
         """Get detailed priority score breakdown for debugging"""
         return f"""
 **Priority Score Breakdown:**
 • Base Score: {priority_score.base_score}
-• Strength Bonus: +{priority_score.strength_bonus}
-• System Bonus: +{priority_score.system_bonus}
-• Ticker Bonus: +{priority_score.ticker_bonus}
-• Timeframe Bonus: +{priority_score.timeframe_bonus}
-• Urgency Bonus: +{priority_score.urgency_bonus}
-• Pattern Bonus: +{priority_score.pattern_bonus}
-**Total Score: {priority_score.total_score}**
-**Priority Level: {priority_score.priority_level.name}**
+• Strength Bonus: {priority_score.strength_bonus}
+• System Bonus: {priority_score.system_bonus}
+• Ticker Bonus: {priority_score.ticker_bonus}
+• Timeframe Bonus: {priority_score.timeframe_bonus}
+• Urgency Bonus: {priority_score.urgency_bonus}
+• Pattern Bonus: {priority_score.pattern_bonus}
+**Total: {priority_score.total_score} → {priority_score.priority_level.name}**
         """.strip()
 
-# Global priority manager instance
+# ✅ NEW: Global priority manager instance with database configuration
 priority_manager = SignalPriorityManager()
 
-# Convenience functions for integration
+# ✅ SIMPLIFIED: Export functions (backward compatibility)
+def should_send_notification(signal: Dict, ticker: str, timeframe: str) -> Tuple[bool, PriorityScore]:
+    """Determine if a signal meets notification criteria"""
+    return priority_manager.should_send_notification(signal, ticker, timeframe)
+
 def calculate_signal_priority(signal: Dict, ticker: str, timeframe: str) -> PriorityScore:
     """Calculate priority score for a signal"""
     return priority_manager.calculate_priority_score(signal, ticker, timeframe)
 
-def should_send_notification(signal: Dict, ticker: str, timeframe: str) -> Tuple[bool, PriorityScore]:
-    """Check if signal should trigger notification"""
-    return priority_manager.should_notify(signal, ticker, timeframe)
-
 def rank_signals_by_priority(signals: List[Tuple[Dict, str, str]]) -> List[Tuple[Dict, str, str, PriorityScore]]:
-    """Rank signals by priority (highest first)"""
-    return priority_manager.rank_signals(signals)
+    """Rank signals by priority score"""
+    return priority_manager.rank_signals_by_priority(signals)
 
 def get_priority_display(priority_score: PriorityScore) -> str:
-    """Get priority display for Discord"""
-    return priority_manager.format_priority_for_discord(priority_score) 
+    """Format priority information for Discord display"""
+    return priority_manager.get_priority_display(priority_score)
+
+# ✅ REMOVED: Old environment-based initialization
+# Priority manager now uses database configuration loaded at startup 
