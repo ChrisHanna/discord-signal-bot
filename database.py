@@ -824,24 +824,54 @@ class DatabaseManager:
                     # Convert to JSON object
                     priority_distribution = json.dumps({item['priority_level']: item['count'] for item in priority_dist})
                     
+                    # ✅ NEW: Calculate success rates from signal_performance table
+                    success_rates = await conn.fetchrow('''
+                        SELECT 
+                            ROUND(
+                                AVG(CASE WHEN success_1h = true THEN 100.0 ELSE 0.0 END), 2
+                            ) as success_rate_1h,
+                            ROUND(
+                                AVG(CASE WHEN success_1d = true THEN 100.0 ELSE 0.0 END), 2
+                            ) as success_rate_1d
+                        FROM signal_performance sp
+                        JOIN signal_notifications sn ON (
+                            sp.ticker = sn.ticker AND 
+                            sp.timeframe = sn.timeframe AND 
+                            sp.signal_type = sn.signal_type AND 
+                            sp.signal_date = sn.signal_date
+                        )
+                        WHERE DATE(sn.notified_at) = $1 
+                          AND sp.ticker = $2 
+                          AND sp.timeframe = $3
+                          AND sn.system = $4
+                    ''', target_date, row['ticker'], row['timeframe'], row['system'])
+                    
+                    # Extract success rates (default to NULL if no performance data)
+                    success_rate_1h = success_rates['success_rate_1h'] if success_rates and success_rates['success_rate_1h'] is not None else None
+                    success_rate_1d = success_rates['success_rate_1d'] if success_rates and success_rates['success_rate_1d'] is not None else None
+                    
                     # Insert/update analytics for this ticker-timeframe-system combination
                     await conn.execute('''
                         INSERT INTO signal_analytics 
                         (date, ticker, timeframe, system, total_signals, sent_signals, 
-                         skipped_signals, avg_priority_score, priority_distribution)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         skipped_signals, avg_priority_score, priority_distribution,
+                         success_rate_1h, success_rate_1d)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                         ON CONFLICT (date, ticker, timeframe, system)
                         DO UPDATE SET
                             total_signals = EXCLUDED.total_signals,
                             sent_signals = EXCLUDED.sent_signals,
                             skipped_signals = EXCLUDED.skipped_signals,
                             avg_priority_score = EXCLUDED.avg_priority_score,
-                            priority_distribution = EXCLUDED.priority_distribution
+                            priority_distribution = EXCLUDED.priority_distribution,
+                            success_rate_1h = EXCLUDED.success_rate_1h,
+                            success_rate_1d = EXCLUDED.success_rate_1d
                     ''', target_date, row['ticker'], row['timeframe'], row['system'],
                          row['total_signals'], row['sent_signals'], row['skipped_signals'],
-                         row['avg_priority_score'], priority_distribution)
+                         row['avg_priority_score'], priority_distribution, 
+                         success_rate_1h, success_rate_1d)
                 
-                self.logger.info(f"✅ Updated analytics for {len(signals_data)} combinations on {target_date}")
+                self.logger.info(f"✅ Updated analytics with success rates for {len(signals_data)} combinations on {target_date}")
                 return True
                 
         except Exception as e:
@@ -1013,6 +1043,105 @@ class DatabaseManager:
             self.logger.error(f"❌ Error cleaning up analytics: {e}")
             return 0
 
+    async def record_signal_performance(self, ticker: str, timeframe: str, signal_type: str,
+                                   signal_date: str, price_at_signal: float,
+                                   price_after_1h: float = None, price_after_4h: float = None,
+                                   price_after_1d: float = None, price_after_3d: float = None) -> bool:
+        """Record signal performance data for success rate calculations"""
+        try:
+            async with self.pool.acquire() as conn:
+                # Parse signal date
+                if ' ' in signal_date:
+                    signal_dt = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
+                else:
+                    signal_dt = datetime.strptime(signal_date, '%Y-%m-%d')
+                
+                # Calculate success for each timeframe (assuming bullish signals for now)
+                # For buy signals: success = price went up
+                # For sell signals: success = price went down
+                success_1h = None
+                success_4h = None  
+                success_1d = None
+                success_3d = None
+                
+                is_bullish = any(word in signal_type.lower() for word in ['buy', 'bullish', 'long'])
+                is_bearish = any(word in signal_type.lower() for word in ['sell', 'bearish', 'short'])
+                
+                if price_after_1h is not None:
+                    if is_bullish:
+                        success_1h = price_after_1h > price_at_signal
+                    elif is_bearish:
+                        success_1h = price_after_1h < price_at_signal
+                    else:
+                        # For neutral signals, consider any significant move as success
+                        success_1h = abs(price_after_1h - price_at_signal) / price_at_signal > 0.01  # 1% move
+                
+                if price_after_4h is not None:
+                    if is_bullish:
+                        success_4h = price_after_4h > price_at_signal
+                    elif is_bearish:
+                        success_4h = price_after_4h < price_at_signal
+                    else:
+                        success_4h = abs(price_after_4h - price_at_signal) / price_at_signal > 0.02  # 2% move
+                
+                if price_after_1d is not None:
+                    if is_bullish:
+                        success_1d = price_after_1d > price_at_signal
+                    elif is_bearish:
+                        success_1d = price_after_1d < price_at_signal
+                    else:
+                        success_1d = abs(price_after_1d - price_at_signal) / price_at_signal > 0.03  # 3% move
+                
+                if price_after_3d is not None:
+                    if is_bullish:
+                        success_3d = price_after_3d > price_at_signal
+                    elif is_bearish:
+                        success_3d = price_after_3d < price_at_signal
+                    else:
+                        success_3d = abs(price_after_3d - price_at_signal) / price_at_signal > 0.05  # 5% move
+                
+                # Calculate max gain/loss for 1d period
+                max_gain_1d = None
+                max_loss_1d = None
+                if price_after_1d is not None:
+                    change_pct = ((price_after_1d - price_at_signal) / price_at_signal) * 100
+                    if change_pct > 0:
+                        max_gain_1d = change_pct
+                    else:
+                        max_loss_1d = abs(change_pct)
+                
+                # Insert performance record
+                await conn.execute('''
+                    INSERT INTO signal_performance 
+                    (ticker, timeframe, signal_type, signal_date, performance_date,
+                     price_at_signal, price_after_1h, price_after_4h, price_after_1d, price_after_3d,
+                     max_gain_1d, max_loss_1d, success_1h, success_4h, success_1d, success_3d)
+                    VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    ON CONFLICT (ticker, timeframe, signal_type, signal_date)
+                    DO UPDATE SET
+                        performance_date = NOW(),
+                        price_at_signal = EXCLUDED.price_at_signal,
+                        price_after_1h = EXCLUDED.price_after_1h,
+                        price_after_4h = EXCLUDED.price_after_4h,
+                        price_after_1d = EXCLUDED.price_after_1d,
+                        price_after_3d = EXCLUDED.price_after_3d,
+                        max_gain_1d = EXCLUDED.max_gain_1d,
+                        max_loss_1d = EXCLUDED.max_loss_1d,
+                        success_1h = EXCLUDED.success_1h,
+                        success_4h = EXCLUDED.success_4h,
+                        success_1d = EXCLUDED.success_1d,
+                        success_3d = EXCLUDED.success_3d
+                ''', ticker, timeframe, signal_type, signal_dt, price_at_signal,
+                     price_after_1h, price_after_4h, price_after_1d, price_after_3d,
+                     max_gain_1d, max_loss_1d, success_1h, success_4h, success_1d, success_3d)
+                
+                self.logger.info(f"✅ Recorded performance for {ticker} {signal_type}")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error recording signal performance: {e}")
+            return False
+
 # Global database manager instance
 db_manager = DatabaseManager()
 
@@ -1101,5 +1230,14 @@ async def get_signal_performance_summary() -> Dict:
     return await db_manager.get_signal_performance_summary()
 
 async def cleanup_old_analytics(days: int = 90) -> int:
-    """Clean up old analytics data"""
-    return await db_manager.cleanup_old_analytics(days) 
+    """Clean up old analytics entries"""
+    return await db_manager.cleanup_old_analytics(days)
+
+async def record_signal_performance(ticker: str, timeframe: str, signal_type: str,
+                               signal_date: str, price_at_signal: float,
+                               price_after_1h: float = None, price_after_4h: float = None,
+                               price_after_1d: float = None, price_after_3d: float = None) -> bool:
+    """Record signal performance data for success rate calculations"""
+    return await db_manager.record_signal_performance(ticker, timeframe, signal_type, signal_date,
+                                                 price_at_signal, price_after_1h, price_after_4h,
+                                                 price_after_1d, price_after_3d) 

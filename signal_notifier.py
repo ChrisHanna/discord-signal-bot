@@ -24,7 +24,7 @@ from dateutil import parser
 import logging
 
 # Import database functionality
-from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization, add_ticker_to_database, remove_ticker_from_database, get_database_tickers, save_vip_tickers_to_database, get_vip_tickers_from_database, save_priority_settings_to_database, update_daily_analytics, get_best_performing_signals, get_signal_performance_summary, cleanup_old_analytics
+from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization, add_ticker_to_database, remove_ticker_from_database, get_database_tickers, save_vip_tickers_to_database, get_vip_tickers_from_database, save_priority_settings_to_database, update_daily_analytics, get_best_performing_signals, get_signal_performance_summary, cleanup_old_analytics, record_signal_performance
 from priority_manager import should_send_notification, get_priority_display, calculate_signal_priority, rank_signals_by_priority, priority_manager
 
 # Import smart scheduler
@@ -4000,6 +4000,8 @@ async def help_command(ctx):
 `!signalreport` - Comprehensive signal report
 `!updateanalytics [DATE]` - Manual analytics update
 `!analyticshealth` - Analytics system health check
+`!successrates [DAYS]` - Signal success rate analysis
+`!testperformance [TICKER]` - Add sample performance data
         """,
         inline=False
     )
@@ -4397,6 +4399,240 @@ async def test_priority_integration(ctx):
         
     except Exception as e:
         await ctx.send(f"❌ Error running priority integration test: {e}")
+
+@bot.command(name='testperformance')
+async def test_signal_performance(ctx, ticker: str = "AAPL"):
+    """Test signal performance tracking by adding sample data
+    
+    Usage:
+    !testperformance          - Test with AAPL
+    !testperformance TSLA     - Test with specific ticker
+    """
+    try:
+        from database import record_signal_performance
+        import random
+        
+        embed = discord.Embed(
+            title="🧪 Signal Performance Test",
+            description=f"Adding sample performance data for {ticker.upper()}",
+            color=0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            # Create sample performance data
+            sample_signals = [
+                {
+                    'signal_type': 'WT Buy Signal',
+                    'signal_date': '2024-01-15 09:30:00',
+                    'price_at_signal': 150.00,
+                    'price_after_1h': 151.50,  # +1% (success)
+                    'price_after_4h': 152.25,  # +1.5% (success)
+                    'price_after_1d': 155.00,  # +3.33% (success)
+                },
+                {
+                    'signal_type': 'WT Sell Signal', 
+                    'signal_date': '2024-01-16 14:15:00',
+                    'price_at_signal': 155.00,
+                    'price_after_1h': 154.20,  # -0.52% (success for sell)
+                    'price_after_4h': 153.50,  # -0.97% (success for sell)
+                    'price_after_1d': 152.00,  # -1.94% (success for sell)
+                },
+                {
+                    'signal_type': 'RSI3M3 Bullish Entry',
+                    'signal_date': '2024-01-17 11:45:00', 
+                    'price_at_signal': 152.00,
+                    'price_after_1h': 151.75,  # -0.16% (failure)
+                    'price_after_4h': 153.10,  # +0.72% (success)
+                    'price_after_1d': 154.80,  # +1.84% (success)
+                }
+            ]
+            
+            success_count = 0
+            total_count = len(sample_signals)
+            
+            for signal in sample_signals:
+                success = await record_signal_performance(
+                    ticker=ticker.upper(),
+                    timeframe='1d',
+                    signal_type=signal['signal_type'],
+                    signal_date=signal['signal_date'],
+                    price_at_signal=signal['price_at_signal'],
+                    price_after_1h=signal['price_after_1h'],
+                    price_after_4h=signal['price_after_4h'],
+                    price_after_1d=signal['price_after_1d']
+                )
+                
+                if success:
+                    success_count += 1
+        
+        # Show results
+        embed.add_field(
+            name="📊 Test Results",
+            value=f"""
+**Signals Added:** {success_count}/{total_count}
+**Ticker:** {ticker.upper()}
+**Timeframe:** 1d
+**Sample Data:** 3 different signal types with realistic price movements
+            """,
+            inline=False
+        )
+        
+        # Calculate expected success rates
+        embed.add_field(
+            name="📈 Expected Success Rates",
+            value="""
+**1h Success Rate:** ~67% (2/3 signals successful)
+**1d Success Rate:** ~100% (3/3 signals successful)
+            """,
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔧 Next Steps",
+            value="`!updateanalytics` - Update analytics to see success rates\n`!performance` - View performance summary\n`!bestperformers` - See top performing signals",
+            inline=False
+        )
+        
+        if success_count == total_count:
+            embed.color = 0x00ff00
+            embed.add_field(
+                name="✅ Success",
+                value="All sample performance data added successfully!",
+                inline=False
+            )
+        else:
+            embed.color = 0xff0000
+            embed.add_field(
+                name="❌ Partial Failure",
+                value=f"Only {success_count}/{total_count} records added successfully",
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error testing signal performance: {e}")
+
+@bot.command(name='successrates')
+async def show_success_rates(ctx, days: int = 30):
+    """Show success rate statistics from signal performance data
+    
+    Usage:
+    !successrates      - Show 30-day success rates
+    !successrates 7    - Show 7-day success rates
+    !successrates 90   - Show 90-day success rates
+    """
+    try:
+        if days < 1 or days > 365:
+            await ctx.send("❌ Days must be between 1 and 365")
+            return
+            
+        embed = discord.Embed(
+            title=f"📈 Signal Success Rates ({days} days)",
+            description="Success rate analysis from signal performance tracking",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            from database import db_manager
+            
+            async with db_manager.pool.acquire() as conn:
+                since_date = datetime.now() - timedelta(days=days)
+                
+                # Overall success rates
+                overall_stats = await conn.fetchrow('''
+                    SELECT 
+                        COUNT(*) as total_signals,
+                        ROUND(AVG(CASE WHEN success_1h = true THEN 100.0 ELSE 0.0 END), 1) as avg_success_1h,
+                        ROUND(AVG(CASE WHEN success_1d = true THEN 100.0 ELSE 0.0 END), 1) as avg_success_1d,
+                        ROUND(AVG(CASE WHEN success_4h = true THEN 100.0 ELSE 0.0 END), 1) as avg_success_4h,
+                        ROUND(AVG(CASE WHEN success_3d = true THEN 100.0 ELSE 0.0 END), 1) as avg_success_3d
+                    FROM signal_performance
+                    WHERE performance_date >= $1
+                ''', since_date)
+                
+                if overall_stats and overall_stats['total_signals'] > 0:
+                    embed.add_field(
+                        name="📊 Overall Success Rates",
+                        value=f"""
+**Total Signals Tracked:** {overall_stats['total_signals']}
+**1 Hour:** {overall_stats['avg_success_1h'] or 0}%
+**4 Hours:** {overall_stats['avg_success_4h'] or 0}%
+**1 Day:** {overall_stats['avg_success_1d'] or 0}%
+**3 Days:** {overall_stats['avg_success_3d'] or 0}%
+                        """,
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="📊 No Performance Data",
+                        value=f"No signal performance data found for the last {days} days.\n\nUse `!testperformance` to add sample data.",
+                        inline=False
+                    )
+                    embed.color = 0xff6600
+                
+                # Success rates by signal type
+                signal_type_stats = await conn.fetch('''
+                    SELECT 
+                        signal_type,
+                        COUNT(*) as count,
+                        ROUND(AVG(CASE WHEN success_1h = true THEN 100.0 ELSE 0.0 END), 1) as success_1h,
+                        ROUND(AVG(CASE WHEN success_1d = true THEN 100.0 ELSE 0.0 END), 1) as success_1d
+                    FROM signal_performance
+                    WHERE performance_date >= $1
+                    GROUP BY signal_type
+                    HAVING COUNT(*) >= 2
+                    ORDER BY success_1d DESC NULLS LAST
+                    LIMIT 10
+                ''', since_date)
+                
+                if signal_type_stats:
+                    signal_text = ""
+                    for signal in signal_type_stats:
+                        signal_text += f"**{signal['signal_type'][:25]}:** 1h={signal['success_1h'] or 0}%, 1d={signal['success_1d'] or 0}% ({signal['count']} signals)\n"
+                    
+                    embed.add_field(
+                        name="🎯 Success by Signal Type",
+                        value=signal_text[:1000],
+                        inline=False
+                    )
+                
+                # Success rates by ticker
+                ticker_stats = await conn.fetch('''
+                    SELECT 
+                        ticker,
+                        COUNT(*) as count,
+                        ROUND(AVG(CASE WHEN success_1h = true THEN 100.0 ELSE 0.0 END), 1) as success_1h,
+                        ROUND(AVG(CASE WHEN success_1d = true THEN 100.0 ELSE 0.0 END), 1) as success_1d
+                    FROM signal_performance
+                    WHERE performance_date >= $1
+                    GROUP BY ticker
+                    HAVING COUNT(*) >= 2
+                    ORDER BY success_1d DESC NULLS LAST
+                    LIMIT 8
+                ''', since_date)
+                
+                if ticker_stats:
+                    ticker_text = ""
+                    for ticker in ticker_stats:
+                        ticker_text += f"**{ticker['ticker']}:** 1h={ticker['success_1h'] or 0}%, 1d={ticker['success_1d'] or 0}% ({ticker['count']} signals)\n"
+                    
+                    embed.add_field(
+                        name="📈 Success by Ticker",
+                        value=ticker_text,
+                        inline=False
+                    )
+        
+        embed.set_footer(text="💡 Use !testperformance to add sample data • !updateanalytics to calculate rates")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting success rates: {e}")
 
 if __name__ == "__main__":
     import asyncio
