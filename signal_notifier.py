@@ -3758,7 +3758,7 @@ async def analytics_health_check(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error running analytics health check: {e}")
 
-@bot.command(name='help')
+@bot.command(name='commands')
 async def help_command(ctx):
     """Show all available bot commands organized by category"""
     embed = discord.Embed(
@@ -3844,7 +3844,7 @@ async def help_command(ctx):
 `!cleanup` - Manual database cleanup
 `!clear [AMOUNT]` - Clear channel messages
 `!watch TICKER` - Add ticker (legacy)
-`!help` - Show this help message
+`!commands` - Show this help message
         """,
         inline=False
     )
@@ -3853,125 +3853,6 @@ async def help_command(ctx):
     embed.set_footer(text="💡 Use [OPTIONAL] for optional parameters • All commands start with !")
     
     await ctx.send(embed=embed)
-
-@bot.command(name='analyticshealth')
-async def analytics_health_check(ctx):
-    """Check the health and status of the analytics system"""
-    try:
-        embed = discord.Embed(
-            title="🔬 Analytics System Health Check",
-            description="Comprehensive status of the analytics and database system",
-            color=0x00ff88,
-            timestamp=datetime.now(EST)
-        )
-        
-        # Test database connection and table existence
-        try:
-            stats = await get_stats()
-            db_connection = "✅ Connected"
-        except Exception as e:
-            db_connection = f"❌ Error: {str(e)[:50]}"
-            stats = {}
-        
-        # Test analytics functions
-        analytics_functions = {}
-        
-        # Test update_daily_analytics
-        try:
-            await update_daily_analytics()
-            analytics_functions['update_daily_analytics'] = "✅ Working"
-        except Exception as e:
-            analytics_functions['update_daily_analytics'] = f"❌ Error: {str(e)[:30]}"
-        
-        # Test get_best_performing_signals
-        try:
-            await get_best_performing_signals(7)
-            analytics_functions['best_performers'] = "✅ Working"
-        except Exception as e:
-            analytics_functions['best_performers'] = f"❌ Error: {str(e)[:30]}"
-        
-        # Test get_signal_performance_summary
-        try:
-            await get_signal_performance_summary()
-            analytics_functions['performance_summary'] = "✅ Working"
-        except Exception as e:
-            analytics_functions['performance_summary'] = f"❌ Error: {str(e)[:30]}"
-        
-        # Database status
-        embed.add_field(
-            name="🗄️ Database Status",
-            value=f"""
-**Connection:** {db_connection}
-**Total Notifications:** {stats.get('total_notifications', 0)}
-**Total Detected:** {stats.get('total_detected', 0)}
-**Utilization Rate:** {stats.get('utilization_rate_24h', 0)}%
-            """,
-            inline=False
-        )
-        
-        # Analytics functions status
-        functions_text = ""
-        for func, status in analytics_functions.items():
-            functions_text += f"**{func}:** {status}\n"
-        
-        embed.add_field(
-            name="📊 Analytics Functions",
-            value=functions_text,
-            inline=False
-        )
-        
-        # Data freshness check
-        current_time = datetime.now(EST)
-        if last_successful_check:
-            time_since_last = current_time - last_successful_check
-            if time_since_last.total_seconds() < 3600:  # Less than 1 hour
-                data_freshness = f"✅ Fresh ({time_since_last.total_seconds()//60:.0f}m ago)"
-            else:
-                data_freshness = f"⚠️ Stale ({time_since_last.total_seconds()//3600:.1f}h ago)"
-        else:
-            data_freshness = "❌ Unknown"
-        
-        embed.add_field(
-            name="📅 Data Freshness",
-            value=f"**Last Signal Check:** {data_freshness}",
-            inline=True
-        )
-        
-        # Analytics integration status
-        analytics_integration = "✅ Enabled" if checks_completed % 5 == 0 else "✅ Scheduled"
-        embed.add_field(
-            name="🔄 Analytics Integration",
-            value=f"**Auto-Updates:** {analytics_integration}\n**Update Frequency:** Every 5 cycles",
-            inline=True
-        )
-        
-        # Overall health score
-        working_functions = sum(1 for status in analytics_functions.values() if "✅" in status)
-        total_functions = len(analytics_functions)
-        health_score = (working_functions / total_functions) * 100
-        
-        if health_score == 100:
-            health_status = "🟢 Excellent"
-            embed.color = 0x00ff00
-        elif health_score >= 75:
-            health_status = "🟡 Good"
-            embed.color = 0xffff00
-        else:
-            health_status = "🔴 Issues Detected"
-            embed.color = 0xff0000
-        
-        embed.add_field(
-            name="🏥 Overall Health",
-            value=f"**Status:** {health_status}\n**Score:** {health_score:.0f}%\n**Functions Working:** {working_functions}/{total_functions}",
-            inline=False
-        )
-        
-        embed.set_footer(text="💡 Use !updateanalytics to manually update • !performance for historical data")
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error running analytics health check: {e}")
 
 if __name__ == "__main__":
     import asyncio
