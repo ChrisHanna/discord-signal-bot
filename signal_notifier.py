@@ -2570,7 +2570,7 @@ async def uptime_command(ctx):
         await ctx.send(f"❌ Error showing uptime: {str(e)}")
 
 @bot.command(name='priority')
-async def priority_settings(ctx, action: str = None, value: str = None):
+async def priority_settings(ctx, action: str = None, sub_action: str = None, ticker: str = None):
     """Manage priority settings for signal notifications
     
     Usage:
@@ -2625,13 +2625,13 @@ async def priority_settings(ctx, action: str = None, value: str = None):
             inline=False
         )
         
-    elif action == "level" and value:
+    elif action == "level" and sub_action:
         valid_levels = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'MINIMAL']
-        if value.upper() in valid_levels:
-            priority_manager.MIN_PRIORITY_LEVEL = value.upper()
+        if sub_action.upper() in valid_levels:
+            priority_manager.MIN_PRIORITY_LEVEL = sub_action.upper()
             embed.add_field(
                 name="✅ Priority Level Updated",
-                value=f"Minimum priority level set to: **{value.upper()}**",
+                value=f"Minimum priority level set to: **{sub_action.upper()}**",
                 inline=False
             )
         else:
@@ -2641,14 +2641,41 @@ async def priority_settings(ctx, action: str = None, value: str = None):
                 inline=False
             )
     
-    elif action == "vip" and value:
-        parts = value.split()
-        if len(parts) >= 2:
-            sub_action = parts[0].lower()
-            ticker = parts[1].upper()
+    elif action == "vip" and sub_action and ticker:
+        ticker = ticker.upper()
+        
+        if sub_action.lower() == "add":
+            priority_manager.VIP_TICKERS.add(ticker)
             
-            if sub_action == "add":
-                priority_manager.VIP_TICKERS.add(ticker)
+            # ✅ FIXED: Save to PostgreSQL database
+            current_vip_tickers = list(priority_manager.VIP_TICKERS)
+            db_success = await save_vip_tickers_to_database(current_vip_tickers)
+            
+            # Also update the priority_manager in-memory set to ensure consistency
+            priority_manager.update_vip_tickers(priority_manager.VIP_TICKERS)
+            
+            embed.add_field(
+                name="✅ VIP Ticker Added",
+                value=f"Added **{ticker}** to VIP tickers list\n**Current VIP Tickers:** {', '.join(sorted(priority_manager.VIP_TICKERS))}",
+                inline=False
+            )
+            
+            if db_success:
+                embed.add_field(
+                    name="💾 Database Storage",
+                    value="✅ VIP tickers saved to PostgreSQL database",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="⚠️ Database Storage", 
+                    value="❌ Warning: Failed to save to PostgreSQL",
+                    inline=False
+                )
+                
+        elif sub_action.lower() == "remove":
+            if ticker in priority_manager.VIP_TICKERS:
+                priority_manager.VIP_TICKERS.discard(ticker)
                 
                 # ✅ FIXED: Save to PostgreSQL database
                 current_vip_tickers = list(priority_manager.VIP_TICKERS)
@@ -2656,32 +2683,6 @@ async def priority_settings(ctx, action: str = None, value: str = None):
                 
                 # Also update the priority_manager in-memory set to ensure consistency
                 priority_manager.update_vip_tickers(priority_manager.VIP_TICKERS)
-                
-                embed.add_field(
-                    name="✅ VIP Ticker Added",
-                    value=f"Added **{ticker}** to VIP tickers list\n**Current VIP Tickers:** {', '.join(sorted(priority_manager.VIP_TICKERS))}",
-                    inline=False
-                )
-                
-                if db_success:
-                    embed.add_field(
-                        name="💾 Database Storage",
-                        value="✅ VIP tickers saved to PostgreSQL database",
-                        inline=False
-                    )
-                else:
-                    embed.add_field(
-                        name="⚠️ Database Storage", 
-                        value="❌ Warning: Failed to save to PostgreSQL",
-                        inline=False
-                    )
-                    
-            elif sub_action == "remove":
-                priority_manager.VIP_TICKERS.discard(ticker)
-                
-                # ✅ FIXED: Save to PostgreSQL database
-                current_vip_tickers = list(priority_manager.VIP_TICKERS)
-                db_success = await save_vip_tickers_to_database(current_vip_tickers)
                 
                 embed.add_field(
                     name="✅ VIP Ticker Removed", 
@@ -2701,9 +2702,21 @@ async def priority_settings(ctx, action: str = None, value: str = None):
                         value="❌ Warning: Failed to update PostgreSQL",
                         inline=False
                     )
+            else:
+                embed.add_field(
+                    name="⚠️ Ticker Not Found",
+                    value=f"**{ticker}** is not in the VIP tickers list",
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="❌ Invalid VIP Action",
+                value="Use `add` or `remove` with VIP commands",
+                inline=False
+            )
     
-    elif action == "test" and value:
-        ticker = value.upper()
+    elif action == "test" and sub_action:
+        test_ticker = sub_action.upper()
         # Create a sample signal for testing
         test_signal = {
             'type': 'WT Buy Signal',
@@ -2712,10 +2725,10 @@ async def priority_settings(ctx, action: str = None, value: str = None):
             'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         
-        priority_score = calculate_signal_priority(test_signal, ticker, '1d')
+        priority_score = calculate_signal_priority(test_signal, test_ticker, '1d')
         
         embed.add_field(
-            name=f"🧪 Priority Test: {ticker}",
+            name=f"🧪 Priority Test: {test_ticker}",
             value=priority_manager.get_debug_breakdown(priority_score),
             inline=False
         )
@@ -2723,7 +2736,14 @@ async def priority_settings(ctx, action: str = None, value: str = None):
     else:
         embed.add_field(
             name="❌ Invalid Command",
-            value="Use `!priority` to see available commands",
+            value="""
+**Usage Examples:**
+`!priority` - Show current settings
+`!priority level HIGH` - Set minimum priority to HIGH
+`!priority vip add MSFT` - Add MSFT to VIP tickers
+`!priority vip remove MSFT` - Remove MSFT from VIP tickers
+`!priority test AAPL` - Test priority scoring for AAPL
+            """,
             inline=False
         )
     
