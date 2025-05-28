@@ -4100,6 +4100,304 @@ async def sync_tickers_with_database():
         print("⚠️ Continuing with config file tickers")
         return False
 
+@bot.command(name='validativips')
+async def validate_vip_tickers(ctx):
+    """Validate VIP tickers against monitored tickers database"""
+    try:
+        validation = await priority_manager.db_config.validate_vip_tickers()
+        
+        embed = discord.Embed(
+            title="🔍 VIP Ticker Validation",
+            description="Checking VIP tickers against monitored tickers database",
+            color=0x00ff00 if validation['validation_passed'] else 0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Validation summary
+        embed.add_field(
+            name="📊 Summary",
+            value=f"""
+**Total VIP Tickers:** {validation['total_vips']}
+**Total Monitored Tickers:** {validation['total_monitored']}
+**Validation Status:** {'✅ Passed' if validation['validation_passed'] else '⚠️ Issues Found'}
+            """,
+            inline=False
+        )
+        
+        # Valid VIP tickers
+        if validation['valid_vips']:
+            valid_text = ", ".join(validation['valid_vips'][:10])
+            if len(validation['valid_vips']) > 10:
+                valid_text += f" ... and {len(validation['valid_vips']) - 10} more"
+            
+            embed.add_field(
+                name="✅ Valid VIP Tickers",
+                value=f"`{valid_text}`",
+                inline=False
+            )
+        
+        # Invalid VIP tickers (if any)
+        if validation['invalid_vips']:
+            invalid_text = ", ".join(validation['invalid_vips'])
+            embed.add_field(
+                name="⚠️ Invalid VIP Tickers",
+                value=f"`{invalid_text}`\n*These tickers are not in the monitored tickers database*",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="💡 Suggested Actions",
+                value="• Use `!addticker SYMBOL` to add missing tickers to monitoring\n"
+                      "• Use `!cleanupvips` to remove invalid VIP tickers\n"
+                      "• Use `!priority vip remove SYMBOL` to manually remove specific VIP tickers",
+                inline=False
+            )
+        
+        # Error handling
+        if 'error' in validation:
+            embed.add_field(
+                name="❌ Validation Error",
+                value=f"```{validation['error']}```",
+                inline=False
+            )
+        
+        embed.set_footer(text="💡 VIP tickers should exist in the monitored tickers database for optimal functionality")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error validating VIP tickers: {e}")
+
+@bot.command(name='cleanupvips')
+async def cleanup_vip_tickers(ctx):
+    """Clean up VIP tickers that don't exist in monitored tickers database"""
+    try:
+        # Send typing indicator for longer operation
+        async with ctx.typing():
+            cleanup_result = await priority_manager.db_config.sync_vip_with_monitored_tickers()
+            
+        if cleanup_result['cleanup_performed']:
+            embed = discord.Embed(
+                title="🧹 VIP Ticker Cleanup Complete",
+                description="Removed invalid VIP tickers from configuration",
+                color=0x00ff00 if cleanup_result['cleanup_success'] else 0xff0000,
+                timestamp=datetime.now(EST)
+            )
+            
+            if cleanup_result['invalid_vips']:
+                embed.add_field(
+                    name="🗑️ Removed VIP Tickers",
+                    value=f"`{', '.join(cleanup_result['invalid_vips'])}`",
+                    inline=False
+                )
+            
+            embed.add_field(
+                name="📊 After Cleanup",
+                value=f"""
+**Valid VIP Tickers:** {len(cleanup_result['valid_vips'])}
+**Remaining VIPs:** {', '.join(cleanup_result['valid_vips']) if cleanup_result['valid_vips'] else 'None'}
+**Database Saved:** {'✅ Yes' if cleanup_result['cleanup_success'] else '❌ Failed'}
+                """,
+                inline=False
+            )
+            
+        else:
+            embed = discord.Embed(
+                title="✅ No Cleanup Needed",
+                description="All VIP tickers are valid and exist in the monitored tickers database",
+                color=0x00ff00,
+                timestamp=datetime.now(EST)
+            )
+            
+            embed.add_field(
+                name="📊 Current Status",
+                value=f"""
+**Valid VIP Tickers:** {len(cleanup_result['valid_vips'])}
+**VIP List:** {', '.join(cleanup_result['valid_vips']) if cleanup_result['valid_vips'] else 'None'}
+                """,
+                inline=False
+            )
+        
+        embed.set_footer(text="💡 Use !validatevips to check VIP ticker status anytime")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error cleaning up VIP tickers: {e}")
+
+@bot.command(name='vipstatus')
+async def vip_ticker_status(ctx):
+    """Show detailed status of VIP tickers and their relationship to monitored tickers"""
+    try:
+        # Get validation data
+        validation = await priority_manager.db_config.validate_vip_tickers()
+        
+        # Get additional data
+        db_tickers = await get_database_tickers()
+        vip_tickers = priority_manager.VIP_TICKERS
+        
+        embed = discord.Embed(
+            title="⭐ VIP Ticker Status Report",
+            description="Comprehensive analysis of VIP ticker configuration",
+            color=0x9932cc,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Overview
+        embed.add_field(
+            name="📊 Overview",
+            value=f"""
+**Total Monitored Tickers:** {len(db_tickers)}
+**Total VIP Tickers:** {len(vip_tickers)}
+**VIP Coverage:** {(len(vip_tickers)/max(len(db_tickers),1)*100):.1f}%
+**Validation Status:** {'✅ All Valid' if validation['validation_passed'] else f'⚠️ {len(validation["invalid_vips"])} Invalid'}
+            """,
+            inline=False
+        )
+        
+        # VIP ticker details
+        if validation['valid_vips']:
+            vip_details = []
+            for vip in sorted(validation['valid_vips'])[:10]:
+                # Check if this ticker is actively monitored
+                monitoring_status = "🟢 Monitored" if vip in db_tickers else "🔴 Not Monitored"
+                vip_details.append(f"• **{vip}** - {monitoring_status}")
+            
+            if len(validation['valid_vips']) > 10:
+                vip_details.append(f"• ... and {len(validation['valid_vips']) - 10} more")
+            
+            embed.add_field(
+                name="✅ Valid VIP Tickers",
+                value="\n".join(vip_details),
+                inline=False
+            )
+        
+        # Invalid VIPs (if any)
+        if validation['invalid_vips']:
+            embed.add_field(
+                name="❌ Invalid VIP Tickers",
+                value=f"```{', '.join(validation['invalid_vips'])}```\n*Not found in monitored tickers database*",
+                inline=False
+            )
+        
+        # Monitoring suggestions
+        non_vip_monitored = set(db_tickers) - set(vip_tickers)
+        if non_vip_monitored:
+            suggestions = sorted(list(non_vip_monitored))[:5]
+            embed.add_field(
+                name="💡 Potential VIP Candidates",
+                value=f"Monitored tickers that could be added as VIP:\n`{', '.join(suggestions)}`{'...' if len(non_vip_monitored) > 5 else ''}",
+                inline=False
+            )
+        
+        # Commands
+        embed.add_field(
+            name="🛠️ Management Commands",
+            value="""
+`!validatevips` - Validate VIP tickers
+`!cleanupvips` - Remove invalid VIP tickers  
+`!priority vip add TICKER` - Add VIP ticker
+`!priority vip remove TICKER` - Remove VIP ticker
+`!addticker TICKER` - Add ticker to monitoring
+            """,
+            inline=False
+        )
+        
+        embed.set_footer(text="💡 VIP tickers receive priority scoring bonuses in signal detection")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting VIP ticker status: {e}")
+
+@bot.command(name='testpriority')
+async def test_priority_integration(ctx):
+    """Run a quick test of the priority-ticker integration"""
+    try:
+        embed = discord.Embed(
+            title="🧪 Priority Integration Test",
+            description="Testing the integration between tickers and priority system",
+            color=0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            # Test 1: Database connectivity
+            try:
+                db_tickers = await get_database_tickers()
+                db_test = f"✅ Connected ({len(db_tickers)} tickers)"
+            except Exception as e:
+                db_test = f"❌ Failed: {str(e)[:50]}"
+            
+            # Test 2: Priority manager initialization
+            try:
+                await priority_manager.reload_from_database()
+                priority_test = f"✅ Loaded ({len(priority_manager.VIP_TICKERS)} VIP tickers)"
+            except Exception as e:
+                priority_test = f"❌ Failed: {str(e)[:50]}"
+            
+            # Test 3: VIP validation
+            try:
+                validation = await priority_manager.db_config.validate_vip_tickers()
+                if validation['validation_passed']:
+                    validation_test = f"✅ All {validation['total_vips']} VIP tickers valid"
+                else:
+                    validation_test = f"⚠️ {len(validation['invalid_vips'])} invalid VIP tickers"
+            except Exception as e:
+                validation_test = f"❌ Failed: {str(e)[:50]}"
+            
+            # Test 4: Priority scoring
+            try:
+                test_signal = {
+                    'type': 'WT Buy Signal',
+                    'strength': 'Strong',
+                    'system': 'Wave Trend',
+                    'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                # Test with first available ticker
+                test_ticker = db_tickers[0] if db_tickers else 'AAPL'
+                score = priority_manager.calculate_priority_score(test_signal, test_ticker, '1d')
+                scoring_test = f"✅ Score calculated: {score.total_score} ({score.priority_level.name})"
+            except Exception as e:
+                scoring_test = f"❌ Failed: {str(e)[:50]}"
+        
+        # Test results
+        embed.add_field(
+            name="🔍 Test Results",
+            value=f"""
+**Database Connection:** {db_test}
+**Priority Manager:** {priority_test}
+**VIP Validation:** {validation_test}
+**Priority Scoring:** {scoring_test}
+            """,
+            inline=False
+        )
+        
+        # Quick stats
+        if db_tickers:
+            embed.add_field(
+                name="📊 Quick Stats",
+                value=f"""
+**Monitored Tickers:** {len(db_tickers)}
+**VIP Tickers:** {len(priority_manager.VIP_TICKERS)}
+**VIP Coverage:** {(len(priority_manager.VIP_TICKERS)/max(len(db_tickers),1)*100):.1f}%
+**Sample Tickers:** {', '.join(db_tickers[:5])}{'...' if len(db_tickers) > 5 else ''}
+                """,
+                inline=False
+            )
+        
+        embed.add_field(
+            name="💡 Commands",
+            value="`!vipstatus` - Detailed VIP analysis\n`!validatevips` - Validate VIP tickers\n`!priority` - Priority settings",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error running priority integration test: {e}")
+
 if __name__ == "__main__":
     import asyncio
     import sys

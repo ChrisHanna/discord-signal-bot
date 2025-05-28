@@ -126,8 +126,21 @@ class DatabasePriorityConfig:
             return False
     
     async def add_vip_ticker(self, ticker: str) -> bool:
-        """Add VIP ticker and save to database"""
+        """Add VIP ticker with validation against tickers table"""
         ticker = ticker.upper().strip()
+        
+        # Validate that ticker exists in database
+        try:
+            from database import get_database_tickers
+            db_tickers = await get_database_tickers()
+            
+            if ticker not in db_tickers:
+                print(f"⚠️ Warning: VIP ticker {ticker} not found in monitored tickers database")
+                print(f"   Available tickers: {', '.join(sorted(db_tickers)[:10])}{'...' if len(db_tickers) > 10 else ''}")
+                # Still allow adding, but warn user
+        except Exception as e:
+            print(f"⚠️ Warning: Could not validate ticker {ticker} against database: {e}")
+            
         if ticker not in self.vip_tickers:
             self.vip_tickers.add(ticker)
             return await self.save_to_database()
@@ -140,6 +153,59 @@ class DatabasePriorityConfig:
             self.vip_tickers.discard(ticker)
             return await self.save_to_database()
         return True
+    
+    async def validate_vip_tickers(self) -> dict:
+        """Validate all VIP tickers against the tickers database"""
+        try:
+            from database import get_database_tickers
+            db_tickers = set(await get_database_tickers())
+            
+            valid_vips = self.vip_tickers & db_tickers
+            invalid_vips = self.vip_tickers - db_tickers
+            
+            return {
+                'valid_vips': sorted(valid_vips),
+                'invalid_vips': sorted(invalid_vips),
+                'total_vips': len(self.vip_tickers),
+                'total_monitored': len(db_tickers),
+                'validation_passed': len(invalid_vips) == 0
+            }
+        except Exception as e:
+            print(f"❌ Error validating VIP tickers: {e}")
+            return {
+                'valid_vips': [],
+                'invalid_vips': [],
+                'total_vips': len(self.vip_tickers),
+                'total_monitored': 0,
+                'validation_passed': False,
+                'error': str(e)
+            }
+    
+    async def sync_vip_with_monitored_tickers(self) -> dict:
+        """Remove VIP tickers that are not in the monitored tickers database"""
+        validation = await self.validate_vip_tickers()
+        
+        if validation['invalid_vips']:
+            print(f"🧹 Cleaning up {len(validation['invalid_vips'])} invalid VIP tickers...")
+            
+            for invalid_ticker in validation['invalid_vips']:
+                self.vip_tickers.discard(invalid_ticker)
+                print(f"   Removed {invalid_ticker} from VIP list")
+            
+            # Save updated configuration
+            save_success = await self.save_to_database()
+            if save_success:
+                print(f"✅ Cleaned VIP tickers saved to database")
+            else:
+                print(f"❌ Failed to save cleaned VIP tickers")
+                
+            validation['cleanup_performed'] = True
+            validation['cleanup_success'] = save_success
+        else:
+            validation['cleanup_performed'] = False
+            validation['cleanup_success'] = True
+            
+        return validation
     
     async def set_min_priority_level(self, level: str) -> bool:
         """Set minimum priority level and save to database"""
