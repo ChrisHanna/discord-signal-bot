@@ -40,9 +40,8 @@ USE_SMART_SCHEDULER = os.getenv('USE_SMART_SCHEDULER', 'true').lower() == 'true'
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 
-# File paths
-LAST_NOTIFICATION_FILE = 'last_notifications.json'
-TICKERS_CONFIG_FILE = 'tickers.json'
+# ✅ REMOVED: JSON file paths and configuration loading functions
+# Now using PostgreSQL database as single source of truth
 
 # Timezone setup
 EST = pytz.timezone('US/Eastern')
@@ -121,65 +120,117 @@ def calculate_time_ago_est(timestamp_str: str) -> str:
         print(f"⚠️ Error calculating time ago for '{timestamp_str}': {e}")
         return "Unknown"
 
-def load_ticker_config() -> Dict:
-    """Load ticker configuration from JSON file"""
-    try:
-        if os.path.exists(TICKERS_CONFIG_FILE):
-            with open(TICKERS_CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        else:
-            # Create default config if file doesn't exist
-            default_config = {
-                "tickers": ["AAPL", "TSLA", "NVDA", "SPY", "QQQ"],
-                "timeframes": ["1d", "1h"],
-                "settings": {
-                    "max_tickers": 50,
-                    "allowed_timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"],
-                    "default_timeframes": ["1d", "1h"]
-                }
-            }
-            save_ticker_config(default_config)
-            return default_config
-    except Exception as e:
-        print(f"❌ Error loading ticker config: {e}")
-        # Return minimal fallback config
-        return {
-            "tickers": ["AAPL", "TSLA"],
-            "timeframes": ["1d"],
-            "settings": {
-                "max_tickers": 50,
-                "allowed_timeframes": ["1d", "1h"],
-                "default_timeframes": ["1d"]
-            }
-        }
-
-def save_ticker_config(config: Dict):
-    """Save ticker configuration to JSON file"""
-    try:
-        temp_file = TICKERS_CONFIG_FILE + '.tmp'
-        with open(temp_file, 'w') as f:
-            json.dump(config, f, indent=4, sort_keys=True)
+# ✅ NEW: Database-based configuration management
+class DatabaseConfig:
+    """Manage configuration using PostgreSQL database as single source of truth"""
+    
+    def __init__(self):
+        self.tickers = []
+        self.timeframes = ['1d', '1h']  # Default timeframes
+        self.max_tickers = 50
+        self.allowed_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
         
-        # Atomic move
-        import shutil
-        shutil.move(temp_file, TICKERS_CONFIG_FILE)
-        print(f"💾 Ticker configuration saved successfully")
-    except Exception as e:
-        print(f"❌ Error saving ticker config: {e}")
+    async def load_from_database(self):
+        """Load configuration from PostgreSQL database"""
+        try:
+            print("🔄 Loading configuration from PostgreSQL database...")
+            
+            # Load tickers from database
+            self.tickers = await get_database_tickers()
+            
+            if not self.tickers:
+                # Initialize with default popular tickers if database is empty
+                default_tickers = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA']
+                print(f"📊 Initializing database with default tickers: {default_tickers}")
+                
+                for ticker in default_tickers:
+                    await add_ticker_to_database(ticker)
+                    
+                self.tickers = default_tickers
+            
+            print(f"✅ Loaded {len(self.tickers)} tickers from database: {', '.join(self.tickers[:10])}{'...' if len(self.tickers) > 10 else ''}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error loading configuration from database: {e}")
+            # Fallback to environment variables if database fails
+            self.load_from_environment()
+            return False
+    
+    def load_from_environment(self):
+        """Fallback: Load configuration from environment variables"""
+        print("⚠️ Falling back to environment variable configuration")
+        
+        # Load tickers from environment
+        tickers_str = os.getenv('TICKERS', 'AAPL,TSLA,NVDA,SPY,QQQ')
+        self.tickers = [ticker.strip().upper() for ticker in tickers_str.split(',') if ticker.strip()]
+        
+        # Load timeframes from environment
+        timeframes_str = os.getenv('TIMEFRAMES', '1d,1h')
+        self.timeframes = [tf.strip() for tf in timeframes_str.split(',') if tf.strip()]
+        
+        print(f"📊 Loaded from environment: {len(self.tickers)} tickers, {len(self.timeframes)} timeframes")
+    
+    async def add_ticker(self, ticker: str) -> bool:
+        """Add ticker to database and update local config"""
+        try:
+            ticker = ticker.upper().strip()
+            
+            if ticker in self.tickers:
+                return False  # Already exists
+                
+            if len(self.tickers) >= self.max_tickers:
+                return False  # Max limit reached
+                
+            # Add to database
+            success = await add_ticker_to_database(ticker)
+            if success:
+                self.tickers.append(ticker)
+                self.tickers.sort()  # Keep sorted
+                return True
+            return False
+            
+        except Exception as e:
+            print(f"❌ Error adding ticker {ticker}: {e}")
+            return False
+    
+    async def remove_ticker(self, ticker: str) -> bool:
+        """Remove ticker from database and update local config"""
+        try:
+            ticker = ticker.upper().strip()
+            
+            if ticker not in self.tickers:
+                return False  # Not found
+                
+            if len(self.tickers) <= 1:
+                return False  # Cannot remove last ticker
+                
+            # Remove from database
+            success = await remove_ticker_from_database(ticker)
+            if success:
+                self.tickers.remove(ticker)
+                return True
+            return False
+            
+        except Exception as e:
+            print(f"❌ Error removing ticker {ticker}: {e}")
+            return False
+    
+    def get_ticker_combinations(self) -> List[tuple]:
+        """Get all ticker-timeframe combinations"""
+        combinations = []
+        for ticker in self.tickers:
+            for timeframe in self.timeframes:
+                combinations.append((ticker, timeframe))
+        return combinations
 
-# Load initial ticker configuration
-ticker_config = load_ticker_config()
-TICKERS = ticker_config.get('tickers', ['AAPL', 'TSLA'])
-TIMEFRAMES = ticker_config.get('timeframes', ['1d'])
+# Initialize database config
+config = DatabaseConfig()
 
-# Legacy environment variable support (fallback)
-if not TICKERS:
-    TICKERS_STR = os.getenv('TICKERS', 'AAPL,TSLA,NVDA,SPY,QQQ')
-    TICKERS = [ticker.strip().upper() for ticker in TICKERS_STR.split(',') if ticker.strip()]
-
-if not TIMEFRAMES:
-    TIMEFRAMES_STR = os.getenv('TIMEFRAMES', '1d')
-    TIMEFRAMES = [tf.strip() for tf in TIMEFRAMES_STR.split(',') if tf.strip()]
+# Legacy support - will be populated after database load
+TICKERS = []
+TIMEFRAMES = ['1d', '1h']
+TICKER_TF_COMBINATIONS = []
 
 # Advanced per-ticker timeframes (overrides TIMEFRAMES if set)
 TICKER_TIMEFRAMES_STR = os.getenv('TICKER_TIMEFRAMES', '')
@@ -195,7 +246,12 @@ if TICKER_TIMEFRAMES_STR:
 # Build the final ticker-timeframe combinations
 def build_ticker_combinations():
     """Build ticker-timeframe combinations from current config"""
-    global TICKER_TF_COMBINATIONS
+    global TICKER_TF_COMBINATIONS, TICKERS, TIMEFRAMES
+    
+    # Update global variables from config
+    TICKERS = config.tickers.copy()
+    TIMEFRAMES = config.timeframes.copy()
+    
     TICKER_TF_COMBINATIONS = []
     
     if TICKER_TIMEFRAMES:
@@ -205,23 +261,12 @@ def build_ticker_combinations():
         print(f"📊 Using per-ticker timeframes: {TICKER_TIMEFRAMES}")
     else:
         # Use simple multi-timeframe (all tickers on all timeframes)
-        for ticker in TICKERS:
-            for timeframe in TIMEFRAMES:
-                TICKER_TF_COMBINATIONS.append((ticker, timeframe))
+        TICKER_TF_COMBINATIONS = config.get_ticker_combinations()
         print(f"📊 Using multi-timeframe: {len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes = {len(TICKER_TF_COMBINATIONS)} combinations")
 
-# Initial build
-build_ticker_combinations()
-
+# Will be built after database initialization
 MAX_SIGNAL_AGE_DAYS = int(os.getenv('MAX_SIGNAL_AGE_DAYS', '1'))
 ONLY_STRONG_SIGNALS = os.getenv('ONLY_STRONG_SIGNALS', 'false').lower() == 'true'
-
-print(f"📊 Loaded configuration:")
-print(f"   Ticker-Timeframe Combinations: {len(TICKER_TF_COMBINATIONS)}")
-for ticker, tf in TICKER_TF_COMBINATIONS:
-    print(f"   • {ticker} ({tf})")
-print(f"   Max signal age: {MAX_SIGNAL_AGE_DAYS} days")
-print(f"   Strong signals only: {ONLY_STRONG_SIGNALS}")
 
 # Global timer tracking for bot commands
 loop_start_time = None
@@ -1036,7 +1081,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    global loop_start_time, bot_start_time, smart_scheduler
+    global loop_start_time, bot_start_time, smart_scheduler, config
     bot_start_time = datetime.now(EST)
     print(f'🤖 {bot.user} has connected to Discord!')
     print(f"🚀 Bot started at: {bot_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
@@ -1047,9 +1092,26 @@ async def on_ready():
     if db_success:
         print("✅ Database connection established successfully")
         
-        # ✅ NEW: Sync ticker list with database first
-        await sync_tickers_with_database()
-        build_ticker_combinations()  # Rebuild combinations with updated ticker list
+        # ✅ NEW: Load configuration from database
+        print("🔄 Loading configuration from database...")
+        config_success = await config.load_from_database()
+        if config_success:
+            print("✅ Configuration loaded from PostgreSQL database")
+        else:
+            print("⚠️ Using fallback configuration from environment variables")
+        
+        # Build ticker combinations after loading config
+        build_ticker_combinations()
+        
+        # Display loaded configuration
+        print(f"📊 Loaded configuration:")
+        print(f"   Ticker-Timeframe Combinations: {len(TICKER_TF_COMBINATIONS)}")
+        for ticker, tf in TICKER_TF_COMBINATIONS[:10]:  # Show first 10
+            print(f"   • {ticker} ({tf})")
+        if len(TICKER_TF_COMBINATIONS) > 10:
+            print(f"   ... and {len(TICKER_TF_COMBINATIONS) - 10} more")
+        print(f"   Max signal age: {MAX_SIGNAL_AGE_DAYS} days")
+        print(f"   Strong signals only: {ONLY_STRONG_SIGNALS}")
         
         # ✅ EXISTING: Sync VIP tickers with database
         print("🎯 Syncing priority manager with database...")
@@ -1057,10 +1119,15 @@ async def on_ready():
         print("✅ Priority manager synchronized with database")
     else:
         print("❌ Failed to initialize database - notifications will not work properly")
+        # Still load fallback config
+        config.load_from_environment()
+        build_ticker_combinations()
     
     print(f"📊 Monitoring {len(TICKER_TF_COMBINATIONS)} ticker-timeframe combinations")
-    for ticker, tf in TICKER_TF_COMBINATIONS:
+    for ticker, tf in TICKER_TF_COMBINATIONS[:10]:
         print(f"   • {ticker} ({tf})")
+    if len(TICKER_TF_COMBINATIONS) > 10:
+        print(f"   ... and {len(TICKER_TF_COMBINATIONS) - 10} more")
     
     print(f"🌐 API endpoint: {API_BASE_URL}")
     print(f"📡 Discord channel: {CHANNEL_ID}")
@@ -1762,6 +1829,8 @@ async def show_config(ctx):
     )
     
     embed.add_field(name="🔢 Total Combinations", value=f"`{len(TICKER_TF_COMBINATIONS)}`", inline=True)
+    embed.add_field(name="📈 Total Tickers", value=f"`{len(config.tickers)}`", inline=True)
+    embed.add_field(name="⏱️ Total Timeframes", value=f"`{len(config.timeframes)}`", inline=True)
     embed.add_field(name="🔄 Check Interval", value=f"`{CHECK_INTERVAL} seconds`", inline=True)
     embed.add_field(name="📅 Max Signal Age", value=f"`{MAX_SIGNAL_AGE_DAYS} days`", inline=True)
     embed.add_field(name="💪 Strong Signals Only", value=f"`{ONLY_STRONG_SIGNALS}`", inline=True)
@@ -1772,9 +1841,63 @@ async def show_config(ctx):
     else:
         embed.add_field(name="⚙️ Configuration Mode", value="`Multi-Timeframe`", inline=True)
     
-    embed.set_footer(text="💡 Configuration is loaded from .env file")
+    embed.add_field(name="💾 Configuration Source", value="✅ **PostgreSQL Database**\n(Single source of truth)", inline=True)
+    
+    embed.set_footer(text="💡 Configuration loaded from PostgreSQL database only")
     
     await ctx.send(embed=embed)
+
+@bot.command(name='tickersync')
+async def ticker_sync_command(ctx):
+    """Sync bot with database tickers (loads from PostgreSQL)"""
+    try:
+        embed = discord.Embed(
+            title="🔄 Ticker Database Sync",
+            description="Reloading ticker configuration from PostgreSQL database",
+            color=0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Show current state
+        embed.add_field(
+            name="Before Sync",
+            value=f"**Tickers:** {len(config.tickers)}\n**Combinations:** {len(TICKER_TF_COMBINATIONS)}",
+            inline=True
+        )
+        
+        # Reload from database
+        config_success = await config.load_from_database()
+        
+        if config_success:
+            # Rebuild combinations
+            build_ticker_combinations()
+            
+            embed.add_field(
+                name="After Sync",
+                value=f"**Tickers:** {len(config.tickers)}\n**Combinations:** {len(TICKER_TF_COMBINATIONS)}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="✅ Sync Successful",
+                value=f"Configuration reloaded from PostgreSQL database\n**Active Tickers:** {', '.join(config.tickers[:5])}{'...' if len(config.tickers) > 5 else ''}",
+                inline=False
+            )
+            embed.color = 0x00ff00
+        else:
+            embed.add_field(
+                name="❌ Sync Failed",
+                value="Failed to reload from database, using current configuration",
+                inline=False
+            )
+            embed.color = 0xff0000
+        
+        embed.set_footer(text="💡 Bot configuration is always loaded from PostgreSQL database")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error syncing tickers: {e}")
 
 @bot.command(name='notifications')
 async def notification_stats(ctx):
@@ -2021,26 +2144,21 @@ async def clear_channel(ctx, limit = None):
 @bot.command(name='addticker')
 async def add_ticker_command(ctx, ticker: str):
     """Add a ticker to the monitoring list"""
-    global TICKERS, TICKER_TF_COMBINATIONS
+    global config
     try:
         ticker = ticker.upper().strip()
-        
-        # Load current config
-        config = load_ticker_config()
-        current_tickers = config.get('tickers', [])
-        max_tickers = config.get('settings', {}).get('max_tickers', 50)
         
         # Validation
         if not ticker:
             await ctx.send("❌ Please provide a valid ticker symbol")
             return
             
-        if ticker in current_tickers:
+        if ticker in config.tickers:
             await ctx.send(f"⚠️ **{ticker}** is already being monitored")
             return
             
-        if len(current_tickers) >= max_tickers:
-            await ctx.send(f"❌ Maximum ticker limit reached ({max_tickers}). Remove a ticker first.")
+        if len(config.tickers) >= config.max_tickers:
+            await ctx.send(f"❌ Maximum ticker limit reached ({config.max_tickers}). Remove a ticker first.")
             return
             
         # Basic ticker validation (alphanumeric, dash, dot)
@@ -2049,51 +2167,40 @@ async def add_ticker_command(ctx, ticker: str):
             await ctx.send(f"❌ Invalid ticker format: **{ticker}**\nTickers should contain only letters, numbers, dots, and dashes.")
             return
             
-        # Add ticker
-        current_tickers.append(ticker)
-        config['tickers'] = sorted(current_tickers)  # Keep sorted
-        save_ticker_config(config)
-        
-        # Update global variables and rebuild combinations
-        TICKERS = config['tickers']
-        build_ticker_combinations()
-        
-        # ✅ NEW: Also store in PostgreSQL database
-        db_success = await add_ticker_to_database(ticker)
-        
-        # Create success embed
-        embed = discord.Embed(
-            title="✅ Ticker Added Successfully!",
-            description=f"**{ticker}** has been added to the monitoring list",
-            color=0x00ff00
-        )
-        embed.add_field(
-            name="📊 Current Status", 
-            value=f"Monitoring **{len(TICKERS)}** tickers across **{len(TIMEFRAMES)}** timeframes\n"
-                  f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
-                  f"**Active immediately** - no restart required",
-            inline=False
-        )
-        embed.add_field(
-            name="🔄 Next Check", 
-            value="The new ticker will be included in the next signal check cycle",
-            inline=False
-        )
+        # Add ticker to database
+        db_success = await config.add_ticker(ticker)
         
         if db_success:
+            # Update global variables and rebuild combinations
+            build_ticker_combinations()
+            
+            # Create success embed
+            embed = discord.Embed(
+                title="✅ Ticker Added Successfully!",
+                description=f"**{ticker}** has been added to the monitoring list",
+                color=0x00ff00
+            )
+            embed.add_field(
+                name="📊 Current Status", 
+                value=f"Monitoring **{len(config.tickers)}** tickers across **{len(config.timeframes)}** timeframes\n"
+                      f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
+                      f"**Active immediately** - no restart required",
+                inline=False
+            )
+            embed.add_field(
+                name="🔄 Next Check", 
+                value="The new ticker will be included in the next signal check cycle",
+                inline=False
+            )
             embed.add_field(
                 name="💾 Database Storage",
                 value="✅ Ticker saved to PostgreSQL database",
                 inline=False
             )
+            
+            await ctx.send(embed=embed)
         else:
-            embed.add_field(
-                name="⚠️ Database Storage",
-                value="❌ Warning: Failed to save to PostgreSQL (functionality not affected)",
-                inline=False
-            )
-        
-        await ctx.send(embed=embed)
+            await ctx.send(f"❌ Failed to add ticker **{ticker}** to database")
         
     except Exception as e:
         await ctx.send(f"❌ Error adding ticker: {str(e)}")
@@ -2101,65 +2208,50 @@ async def add_ticker_command(ctx, ticker: str):
 @bot.command(name='removeticker')
 async def remove_ticker_command(ctx, ticker: str):
     """Remove a ticker from the monitoring list"""
-    global TICKERS, TICKER_TF_COMBINATIONS
+    global config
     try:
         ticker = ticker.upper().strip()
-        
-        # Load current config
-        config = load_ticker_config()
-        current_tickers = config.get('tickers', [])
         
         if not ticker:
             await ctx.send("❌ Please provide a valid ticker symbol")
             return
             
-        if ticker not in current_tickers:
+        if ticker not in config.tickers:
             await ctx.send(f"⚠️ **{ticker}** is not in the monitoring list")
             return
             
-        if len(current_tickers) <= 1:
+        if len(config.tickers) <= 1:
             await ctx.send("❌ Cannot remove the last ticker. At least one ticker must be monitored.")
             return
             
-        # Remove ticker
-        current_tickers.remove(ticker)
-        config['tickers'] = current_tickers
-        save_ticker_config(config)
-        
-        # Update global variables and rebuild combinations
-        TICKERS = config['tickers']
-        build_ticker_combinations()
-        
-        # ✅ NEW: Also remove from PostgreSQL database
-        db_success = await remove_ticker_from_database(ticker)
-        
-        # Create success embed
-        embed = discord.Embed(
-            title="🗑️ Ticker Removed Successfully!",
-            description=f"**{ticker}** has been removed from the monitoring list",
-            color=0xff9900
-        )
-        embed.add_field(
-            name="📊 Current Status", 
-            value=f"Monitoring **{len(TICKERS)}** tickers across **{len(TIMEFRAMES)}** timeframes\n"
-                  f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**",
-            inline=False
-        )
+        # Remove ticker from database
+        db_success = await config.remove_ticker(ticker)
         
         if db_success:
+            # Update global variables and rebuild combinations
+            build_ticker_combinations()
+            
+            # Create success embed
+            embed = discord.Embed(
+                title="🗑️ Ticker Removed Successfully!",
+                description=f"**{ticker}** has been removed from the monitoring list",
+                color=0xff9900
+            )
+            embed.add_field(
+                name="📊 Current Status", 
+                value=f"Monitoring **{len(config.tickers)}** tickers across **{len(config.timeframes)}** timeframes\n"
+                      f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**",
+                inline=False
+            )
             embed.add_field(
                 name="💾 Database Storage",
                 value="✅ Ticker removed from PostgreSQL database",
                 inline=False
             )
+            
+            await ctx.send(embed=embed)
         else:
-            embed.add_field(
-                name="⚠️ Database Storage",
-                value="❌ Warning: Failed to remove from PostgreSQL (functionality not affected)",
-                inline=False
-            )
-        
-        await ctx.send(embed=embed)
+            await ctx.send(f"❌ Failed to remove ticker **{ticker}** from database")
         
     except Exception as e:
         await ctx.send(f"❌ Error removing ticker: {str(e)}")
@@ -2168,10 +2260,10 @@ async def remove_ticker_command(ctx, ticker: str):
 async def list_tickers_command(ctx):
     """List all currently monitored tickers"""
     try:
-        config = load_ticker_config()
-        tickers = config.get('tickers', [])
-        timeframes = config.get('timeframes', ['1d'])
-        max_tickers = config.get('settings', {}).get('max_tickers', 50)
+        # Use global config
+        tickers = config.tickers
+        timeframes = config.timeframes
+        max_tickers = config.max_tickers
         
         # Create embed
         embed = discord.Embed(
@@ -2226,6 +2318,12 @@ async def list_tickers_command(ctx):
             inline=False
         )
         
+        embed.add_field(
+            name="💾 Data Source",
+            value="✅ PostgreSQL Database\n(Single source of truth)",
+            inline=False
+        )
+        
         await ctx.send(embed=embed)
         
     except Exception as e:
@@ -2234,11 +2332,10 @@ async def list_tickers_command(ctx):
 @bot.command(name='timeframes')
 async def timeframes_command(ctx, action: str = None, timeframe: str = None):
     """Manage timeframes: !timeframes list|add|remove [timeframe]"""
-    global TIMEFRAMES, TICKER_TF_COMBINATIONS
+    global config
     try:
-        config = load_ticker_config()
-        current_timeframes = config.get('timeframes', ['1d'])
-        allowed_timeframes = config.get('settings', {}).get('allowed_timeframes', ['1d', '1h'])
+        current_timeframes = config.timeframes
+        allowed_timeframes = config.allowed_timeframes
         
         if not action:
             action = 'list'
@@ -2262,7 +2359,7 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
             # Statistics
             embed.add_field(
                 name="📈 Impact",
-                value=f"**Tickers**: {len(TICKERS)}\n"
+                value=f"**Tickers**: {len(config.tickers)}\n"
                       f"**Timeframes**: {len(current_timeframes)}\n"
                       f"**Total Combinations**: {len(TICKER_TF_COMBINATIONS)}",
                 inline=False
@@ -2272,6 +2369,12 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
                 name="🛠️ Commands",
                 value="`!timeframes add 1h` - Add timeframe\n"
                       "`!timeframes remove 1h` - Remove timeframe",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="💾 Data Source",
+                value="✅ PostgreSQL Database",
                 inline=False
             )
             
@@ -2295,11 +2398,9 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
                 
             # Add timeframe
             current_timeframes.append(timeframe)
-            config['timeframes'] = current_timeframes
-            save_ticker_config(config)
+            config.timeframes = current_timeframes
             
             # Update globals
-            TIMEFRAMES = current_timeframes
             build_ticker_combinations()
             
             embed = discord.Embed(
@@ -2310,7 +2411,7 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
             embed.add_field(
                 name="📊 New Status",
                 value=f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
-                      f"({len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes)",
+                      f"({len(config.tickers)} tickers × {len(config.timeframes)} timeframes)",
                 inline=False
             )
             
@@ -2333,11 +2434,9 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
                 
             # Remove timeframe
             current_timeframes.remove(timeframe)
-            config['timeframes'] = current_timeframes
-            save_ticker_config(config)
+            config.timeframes = current_timeframes
             
             # Update globals
-            TIMEFRAMES = current_timeframes
             build_ticker_combinations()
             
             embed = discord.Embed(
@@ -2348,7 +2447,7 @@ async def timeframes_command(ctx, action: str = None, timeframe: str = None):
             embed.add_field(
                 name="📊 New Status",
                 value=f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
-                      f"({len(TICKERS)} tickers × {len(TIMEFRAMES)} timeframes)",
+                      f"({len(config.tickers)} tickers × {len(config.timeframes)} timeframes)",
                 inline=False
             )
             
