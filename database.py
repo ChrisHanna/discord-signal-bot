@@ -621,7 +621,7 @@ class DatabaseManager:
                     'last_7d': last_7d,
                     'detected_24h': detected_24h,
                     'utilization_rate_24h': round((last_24h / max(detected_24h, 1)) * 100, 1),
-                    'priority_distribution': dict(priority_dist) if priority_dist else {},
+                    'priority_distribution': json.dumps({item['priority_level']: item['count'] for item in priority_dist}) if priority_dist else {},
                     'most_active_ticker': dict(most_active) if most_active else None,
                     'most_common_signal': dict(most_common) if most_common else None
                 }
@@ -636,6 +636,362 @@ class DatabaseManager:
             await self.pool.close()
             self.logger.info("📤 Database connection closed")
 
+    # Ticker Management Functions
+    async def add_ticker_to_db(self, ticker: str, name: str = None, exchange: str = None) -> bool:
+        """Add a ticker to the database"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO tickers (symbol, name, exchange, active)
+                    VALUES ($1, $2, $3, true)
+                    ON CONFLICT (symbol) 
+                    DO UPDATE SET active = true, name = COALESCE(EXCLUDED.name, tickers.name)
+                ''', ticker, name, exchange)
+                return True
+        except Exception as e:
+            self.logger.error(f"❌ Error adding ticker to database: {e}")
+            return False
+
+    async def remove_ticker_from_db(self, ticker: str) -> bool:
+        """Remove a ticker from the database (mark as inactive)"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    UPDATE tickers SET active = false WHERE symbol = $1
+                ''', ticker)
+                return True
+        except Exception as e:
+            self.logger.error(f"❌ Error removing ticker from database: {e}")
+            return False
+
+    async def get_active_tickers(self) -> List[str]:
+        """Get list of active tickers from database"""
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch('''
+                    SELECT symbol FROM tickers WHERE active = true ORDER BY symbol
+                ''')
+                return [row['symbol'] for row in rows]
+        except Exception as e:
+            self.logger.error(f"❌ Error getting active tickers: {e}")
+            return []
+
+    async def save_vip_tickers(self, vip_tickers: List[str], config_name: str = 'default') -> bool:
+        """Save VIP tickers to database"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO priority_config 
+                    (config_name, min_priority_level, critical_threshold, high_threshold,
+                     medium_threshold, low_threshold, vip_tickers, vip_timeframes)
+                    VALUES ($1, 'MEDIUM', 90, 70, 50, 30, $2, ARRAY['1d', '4h'])
+                    ON CONFLICT (config_name)
+                    DO UPDATE SET 
+                        vip_tickers = EXCLUDED.vip_tickers,
+                        updated_at = NOW()
+                ''', config_name, vip_tickers)
+                return True
+        except Exception as e:
+            self.logger.error(f"❌ Error saving VIP tickers: {e}")
+            return False
+
+    async def get_vip_tickers(self, config_name: str = 'default') -> List[str]:
+        """Get VIP tickers from database"""
+        try:
+            async with self.pool.acquire() as conn:
+                result = await conn.fetchval('''
+                    SELECT vip_tickers FROM priority_config 
+                    WHERE config_name = $1 AND is_active = true
+                ''', config_name)
+                return result or []
+        except Exception as e:
+            self.logger.error(f"❌ Error getting VIP tickers: {e}")
+            return []
+
+    async def save_vip_timeframes(self, vip_timeframes: List[str], config_name: str = 'default') -> bool:
+        """Save VIP timeframes to database"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO priority_config 
+                    (config_name, min_priority_level, critical_threshold, high_threshold,
+                     medium_threshold, low_threshold, vip_tickers, vip_timeframes)
+                    VALUES ($1, 'MEDIUM', 90, 70, 50, 30, ARRAY['SPY', 'QQQ'], $2)
+                    ON CONFLICT (config_name)
+                    DO UPDATE SET 
+                        vip_timeframes = EXCLUDED.vip_timeframes,
+                        updated_at = NOW()
+                ''', config_name, vip_timeframes)
+                return True
+        except Exception as e:
+            self.logger.error(f"❌ Error saving VIP timeframes: {e}")
+            return False
+
+    async def save_priority_settings(self, config_name: str = 'default', 
+                                   min_priority_level: str = 'MEDIUM',
+                                   vip_tickers: List[str] = None,
+                                   vip_timeframes: List[str] = None) -> bool:
+        """Save complete priority settings to database"""
+        try:
+            async with self.pool.acquire() as conn:
+                # Get existing config or use defaults
+                existing = await conn.fetchrow('''
+                    SELECT * FROM priority_config WHERE config_name = $1
+                ''', config_name)
+                
+                if existing:
+                    # Update existing config
+                    await conn.execute('''
+                        UPDATE priority_config SET
+                            min_priority_level = $2,
+                            vip_tickers = COALESCE($3, vip_tickers),
+                            vip_timeframes = COALESCE($4, vip_timeframes),
+                            updated_at = NOW()
+                        WHERE config_name = $1
+                    ''', config_name, min_priority_level, vip_tickers, vip_timeframes)
+                else:
+                    # Create new config
+                    await conn.execute('''
+                        INSERT INTO priority_config 
+                        (config_name, min_priority_level, critical_threshold, high_threshold,
+                         medium_threshold, low_threshold, vip_tickers, vip_timeframes)
+                        VALUES ($1, $2, 90, 70, 50, 30, $3, $4)
+                    ''', config_name, min_priority_level, 
+                         vip_tickers or ['SPY', 'QQQ'], 
+                         vip_timeframes or ['1d', '4h'])
+                
+                return True
+        except Exception as e:
+            self.logger.error(f"❌ Error saving priority settings: {e}")
+            return False
+
+    # Signal Analytics Functions
+    async def update_daily_analytics(self, target_date: str = None) -> bool:
+        """Update signal analytics for a specific date (or today if not specified)"""
+        try:
+            async with self.pool.acquire() as conn:
+                if target_date is None:
+                    target_date = datetime.now().date()
+                else:
+                    target_date = datetime.strptime(target_date, '%Y-%m-%d').date()
+                
+                # Get all detected signals for the date
+                signals_data = await conn.fetch('''
+                    SELECT ticker, timeframe, system, 
+                           COUNT(*) as total_signals,
+                           COUNT(*) FILTER (WHERE was_sent = true) as sent_signals,
+                           COUNT(*) FILTER (WHERE was_sent = false) as skipped_signals,
+                           AVG(priority_score) as avg_priority_score
+                    FROM signals_detected 
+                    WHERE DATE(detected_at) = $1
+                    GROUP BY ticker, timeframe, system
+                ''', target_date)
+                
+                # Get priority distribution separately for each group
+                for row in signals_data:
+                    # Get priority distribution for this specific combination
+                    priority_dist = await conn.fetch('''
+                        SELECT priority_level, COUNT(*) as count
+                        FROM signals_detected 
+                        WHERE DATE(detected_at) = $1 
+                          AND ticker = $2 
+                          AND timeframe = $3 
+                          AND system = $4
+                        GROUP BY priority_level
+                    ''', target_date, row['ticker'], row['timeframe'], row['system'])
+                    
+                    # Convert to JSON object
+                    priority_distribution = json.dumps({item['priority_level']: item['count'] for item in priority_dist})
+                    
+                    # Insert/update analytics for this ticker-timeframe-system combination
+                    await conn.execute('''
+                        INSERT INTO signal_analytics 
+                        (date, ticker, timeframe, system, total_signals, sent_signals, 
+                         skipped_signals, avg_priority_score, priority_distribution)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (date, ticker, timeframe, system)
+                        DO UPDATE SET
+                            total_signals = EXCLUDED.total_signals,
+                            sent_signals = EXCLUDED.sent_signals,
+                            skipped_signals = EXCLUDED.skipped_signals,
+                            avg_priority_score = EXCLUDED.avg_priority_score,
+                            priority_distribution = EXCLUDED.priority_distribution
+                    ''', target_date, row['ticker'], row['timeframe'], row['system'],
+                         row['total_signals'], row['sent_signals'], row['skipped_signals'],
+                         row['avg_priority_score'], priority_distribution)
+                
+                self.logger.info(f"✅ Updated analytics for {len(signals_data)} combinations on {target_date}")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error updating daily analytics: {e}")
+            return False
+
+    async def get_best_performing_signals(self, days: int = 30) -> Dict:
+        """Get historically best performing signals based on analytics data"""
+        try:
+            async with self.pool.acquire() as conn:
+                since_date = datetime.now().date() - timedelta(days=days)
+                
+                # Get best performing ticker-system combinations
+                best_performers = await conn.fetch('''
+                    SELECT 
+                        ticker, system, timeframe,
+                        SUM(total_signals) as total_signals,
+                        SUM(sent_signals) as total_sent,
+                        AVG(avg_priority_score) as avg_priority,
+                        ROUND((SUM(sent_signals)::decimal / NULLIF(SUM(total_signals), 0)) * 100, 1) as utilization_rate,
+                        COUNT(DISTINCT date) as active_days
+                    FROM signal_analytics 
+                    WHERE date >= $1
+                    GROUP BY ticker, system, timeframe
+                    HAVING SUM(total_signals) >= 5  -- Minimum 5 signals for statistical relevance
+                    ORDER BY utilization_rate DESC, avg_priority DESC
+                    LIMIT 20
+                ''', since_date)
+                
+                # Get most active signal types
+                most_active_systems = await conn.fetch('''
+                    SELECT 
+                        system,
+                        SUM(total_signals) as total_signals,
+                        SUM(sent_signals) as total_sent,
+                        AVG(avg_priority_score) as avg_priority,
+                        COUNT(DISTINCT ticker) as unique_tickers
+                    FROM signal_analytics 
+                    WHERE date >= $1
+                    GROUP BY system
+                    ORDER BY total_signals DESC
+                ''', since_date)
+                
+                # Get consistently high priority tickers
+                consistent_performers = await conn.fetch('''
+                    SELECT 
+                        ticker,
+                        AVG(avg_priority_score) as avg_priority,
+                        SUM(total_signals) as total_signals,
+                        SUM(sent_signals) as total_sent,
+                        COUNT(DISTINCT date) as active_days,
+                        COUNT(DISTINCT system) as signal_systems
+                    FROM signal_analytics 
+                    WHERE date >= $1
+                    GROUP BY ticker
+                    HAVING AVG(avg_priority_score) >= 60  -- High average priority
+                    ORDER BY avg_priority DESC, total_signals DESC
+                    LIMIT 15
+                ''', since_date)
+                
+                # Get daily trends
+                daily_trends = await conn.fetch('''
+                    SELECT 
+                        date,
+                        SUM(total_signals) as daily_signals,
+                        SUM(sent_signals) as daily_sent,
+                        AVG(avg_priority_score) as daily_avg_priority
+                    FROM signal_analytics 
+                    WHERE date >= $1
+                    GROUP BY date
+                    ORDER BY date DESC
+                    LIMIT 30
+                ''', since_date)
+                
+                return {
+                    'best_performers': [dict(row) for row in best_performers],
+                    'most_active_systems': [dict(row) for row in most_active_systems],
+                    'consistent_performers': [dict(row) for row in consistent_performers],
+                    'daily_trends': [dict(row) for row in daily_trends],
+                    'analysis_period_days': days
+                }
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error getting best performing signals: {e}")
+            return {}
+
+    async def get_signal_performance_summary(self) -> Dict:
+        """Get overall signal performance summary from analytics"""
+        try:
+            async with self.pool.acquire() as conn:
+                # Overall statistics
+                overall_stats = await conn.fetchrow('''
+                    SELECT 
+                        SUM(total_signals) as total_signals_all_time,
+                        SUM(sent_signals) as total_sent_all_time,
+                        AVG(avg_priority_score) as overall_avg_priority,
+                        COUNT(DISTINCT ticker) as unique_tickers,
+                        COUNT(DISTINCT system) as unique_systems,
+                        MIN(date) as earliest_date,
+                        MAX(date) as latest_date
+                    FROM signal_analytics
+                ''')
+                
+                # Last 30 days performance
+                since_30d = datetime.now().date() - timedelta(days=30)
+                recent_stats = await conn.fetchrow('''
+                    SELECT 
+                        SUM(total_signals) as signals_30d,
+                        SUM(sent_signals) as sent_30d,
+                        AVG(avg_priority_score) as avg_priority_30d,
+                        COUNT(DISTINCT date) as active_days_30d
+                    FROM signal_analytics
+                    WHERE date >= $1
+                ''', since_30d)
+                
+                # Top performing system
+                top_system = await conn.fetchrow('''
+                    SELECT 
+                        system,
+                        SUM(total_signals) as total_signals,
+                        AVG(avg_priority_score) as avg_priority
+                    FROM signal_analytics
+                    GROUP BY system
+                    ORDER BY total_signals DESC, avg_priority DESC
+                    LIMIT 1
+                ''')
+                
+                # Most reliable ticker
+                top_ticker = await conn.fetchrow('''
+                    SELECT 
+                        ticker,
+                        SUM(total_signals) as total_signals,
+                        AVG(avg_priority_score) as avg_priority,
+                        ROUND((SUM(sent_signals)::decimal / NULLIF(SUM(total_signals), 0)) * 100, 1) as utilization_rate
+                    FROM signal_analytics
+                    GROUP BY ticker
+                    HAVING SUM(total_signals) >= 10
+                    ORDER BY utilization_rate DESC, avg_priority DESC
+                    LIMIT 1
+                ''')
+                
+                return {
+                    'overall_stats': dict(overall_stats) if overall_stats else {},
+                    'recent_stats': dict(recent_stats) if recent_stats else {},
+                    'top_system': dict(top_system) if top_system else {},
+                    'top_ticker': dict(top_ticker) if top_ticker else {}
+                }
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error getting signal performance summary: {e}")
+            return {}
+
+    async def cleanup_old_analytics(self, days: int = 90) -> int:
+        """Clean up analytics data older than specified days"""
+        try:
+            async with self.pool.acquire() as conn:
+                cutoff_date = datetime.now().date() - timedelta(days=days)
+                
+                result = await conn.execute('''
+                    DELETE FROM signal_analytics 
+                    WHERE date < $1
+                ''', cutoff_date)
+                
+                deleted_count = int(result.split()[-1])
+                self.logger.info(f"🧹 Cleaned up {deleted_count} old analytics records")
+                return deleted_count
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error cleaning up analytics: {e}")
+            return 0
+
 # Global database manager instance
 db_manager = DatabaseManager()
 
@@ -644,7 +1000,7 @@ async def init_database():
     return await db_manager.initialize()
 
 async def check_duplicate(ticker: str, timeframe: str, signal_type: str, signal_date: str) -> bool:
-    """Check if we've already sent this notification"""
+    """Check if notification is duplicate"""
     return await db_manager.check_duplicate_notification(ticker, timeframe, signal_type, signal_date)
 
 async def record_notification(ticker: str, timeframe: str, signal_type: str, signal_date: str,
@@ -680,4 +1036,49 @@ async def get_signal_utilization() -> Dict:
 
 async def cleanup_old(days: int = 30) -> int:
     """Clean up old notification entries"""
-    return await db_manager.cleanup_old_notifications(days) 
+    return await db_manager.cleanup_old_notifications(days)
+
+# New ticker management functions
+async def add_ticker_to_database(ticker: str, name: str = None, exchange: str = None) -> bool:
+    """Add ticker to PostgreSQL database"""
+    return await db_manager.add_ticker_to_db(ticker, name, exchange)
+
+async def remove_ticker_from_database(ticker: str) -> bool:
+    """Remove ticker from PostgreSQL database"""
+    return await db_manager.remove_ticker_from_db(ticker)
+
+async def get_database_tickers() -> List[str]:
+    """Get active tickers from PostgreSQL database"""
+    return await db_manager.get_active_tickers()
+
+async def save_vip_tickers_to_database(vip_tickers: List[str], config_name: str = 'default') -> bool:
+    """Save VIP tickers to PostgreSQL database"""
+    return await db_manager.save_vip_tickers(vip_tickers, config_name)
+
+async def get_vip_tickers_from_database(config_name: str = 'default') -> List[str]:
+    """Get VIP tickers from PostgreSQL database"""
+    return await db_manager.get_vip_tickers(config_name)
+
+async def save_priority_settings_to_database(config_name: str = 'default', 
+                                           min_priority_level: str = 'MEDIUM',
+                                           vip_tickers: List[str] = None,
+                                           vip_timeframes: List[str] = None) -> bool:
+    """Save priority settings to PostgreSQL database"""
+    return await db_manager.save_priority_settings(config_name, min_priority_level, vip_tickers, vip_timeframes)
+
+# New analytics functions
+async def update_daily_analytics(target_date: str = None) -> bool:
+    """Update daily signal analytics"""
+    return await db_manager.update_daily_analytics(target_date)
+
+async def get_best_performing_signals(days: int = 30) -> Dict:
+    """Get best performing signals from analytics"""
+    return await db_manager.get_best_performing_signals(days)
+
+async def get_signal_performance_summary() -> Dict:
+    """Get overall signal performance summary"""
+    return await db_manager.get_signal_performance_summary()
+
+async def cleanup_old_analytics(days: int = 90) -> int:
+    """Clean up old analytics data"""
+    return await db_manager.cleanup_old_analytics(days) 

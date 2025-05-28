@@ -24,7 +24,7 @@ from dateutil import parser
 import logging
 
 # Import database functionality
-from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization
+from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization, add_ticker_to_database, remove_ticker_from_database, get_database_tickers, save_vip_tickers_to_database, get_vip_tickers_from_database, save_priority_settings_to_database, update_daily_analytics, get_best_performing_signals, get_signal_performance_summary, cleanup_old_analytics
 from priority_manager import should_send_notification, get_priority_display, calculate_signal_priority, rank_signals_by_priority, priority_manager
 
 # Import smart scheduler
@@ -1119,6 +1119,14 @@ async def signal_check_loop():
             if cleaned_count > 0:
                 print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
         
+        # ✅ NEW: Update daily analytics (every 5 cycles)
+        if checks_completed % 5 == 0:
+            analytics_success = await update_daily_analytics()
+            if analytics_success:
+                print(f"📊 Updated daily analytics for today")
+            else:
+                print(f"⚠️ Failed to update daily analytics")
+        
         # Check each ticker across all timeframes
         api_errors = 0
         discord_errors = 0
@@ -2037,6 +2045,9 @@ async def add_ticker_command(ctx, ticker: str):
         TICKERS = config['tickers']
         build_ticker_combinations()
         
+        # ✅ NEW: Also store in PostgreSQL database
+        db_success = await add_ticker_to_database(ticker)
+        
         # Create success embed
         embed = discord.Embed(
             title="✅ Ticker Added Successfully!",
@@ -2054,6 +2065,19 @@ async def add_ticker_command(ctx, ticker: str):
             value="The new ticker will be included in the next signal check cycle",
             inline=False
         )
+        
+        if db_success:
+            embed.add_field(
+                name="💾 Database Storage",
+                value="✅ Ticker saved to PostgreSQL database",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="⚠️ Database Storage",
+                value="❌ Warning: Failed to save to PostgreSQL (functionality not affected)",
+                inline=False
+            )
         
         await ctx.send(embed=embed)
         
@@ -2092,6 +2116,9 @@ async def remove_ticker_command(ctx, ticker: str):
         TICKERS = config['tickers']
         build_ticker_combinations()
         
+        # ✅ NEW: Also remove from PostgreSQL database
+        db_success = await remove_ticker_from_database(ticker)
+        
         # Create success embed
         embed = discord.Embed(
             title="🗑️ Ticker Removed Successfully!",
@@ -2104,6 +2131,19 @@ async def remove_ticker_command(ctx, ticker: str):
                   f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**",
             inline=False
         )
+        
+        if db_success:
+            embed.add_field(
+                name="💾 Database Storage",
+                value="✅ Ticker removed from PostgreSQL database",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="⚠️ Database Storage",
+                value="❌ Warning: Failed to remove from PostgreSQL (functionality not affected)",
+                inline=False
+            )
         
         await ctx.send(embed=embed)
         
@@ -2600,18 +2640,55 @@ async def priority_settings(ctx, action: str = None, value: str = None):
             
             if sub_action == "add":
                 priority_manager.VIP_TICKERS.add(ticker)
+                
+                # ✅ NEW: Save to PostgreSQL database
+                current_vip_tickers = list(priority_manager.VIP_TICKERS)
+                db_success = await save_vip_tickers_to_database(current_vip_tickers)
+                
                 embed.add_field(
                     name="✅ VIP Ticker Added",
                     value=f"Added **{ticker}** to VIP tickers list",
                     inline=False
                 )
+                
+                if db_success:
+                    embed.add_field(
+                        name="💾 Database Storage",
+                        value="✅ VIP tickers saved to PostgreSQL database",
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="⚠️ Database Storage", 
+                        value="❌ Warning: Failed to save to PostgreSQL",
+                        inline=False
+                    )
+                    
             elif sub_action == "remove":
                 priority_manager.VIP_TICKERS.discard(ticker)
+                
+                # ✅ NEW: Save to PostgreSQL database
+                current_vip_tickers = list(priority_manager.VIP_TICKERS)
+                db_success = await save_vip_tickers_to_database(current_vip_tickers)
+                
                 embed.add_field(
                     name="✅ VIP Ticker Removed", 
                     value=f"Removed **{ticker}** from VIP tickers list",
                     inline=False
                 )
+                
+                if db_success:
+                    embed.add_field(
+                        name="💾 Database Storage",
+                        value="✅ VIP tickers updated in PostgreSQL database",
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="⚠️ Database Storage",
+                        value="❌ Warning: Failed to update PostgreSQL",
+                        inline=False
+                    )
     
     elif action == "test" and value:
         ticker = value.upper()
@@ -3087,6 +3164,14 @@ async def smart_signal_check(cycle_count: int, is_priority: bool, reason: str):
             if cleaned_count > 0:
                 print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
         
+        # ✅ NEW: Update daily analytics (every 5 cycles)
+        if cycle_count % 5 == 0:
+            analytics_success = await update_daily_analytics()
+            if analytics_success:
+                print(f"📊 Updated daily analytics for today")
+            else:
+                print(f"⚠️ Failed to update daily analytics")
+        
         # Check each ticker across all timeframes
         api_errors = 0
         discord_errors = 0
@@ -3209,6 +3294,332 @@ async def smart_signal_check(cycle_count: int, is_priority: bool, reason: str):
         except:
             pass  # Don't let notification errors crash the scheduler
 
+@bot.command(name='dbsync')
+async def database_sync(ctx):
+    """Show and sync database stored tickers and VIP settings"""
+    try:
+        embed = discord.Embed(
+            title="🗄️ Database Storage Status",
+            description="PostgreSQL stored tickers and VIP settings",
+            color=0x9932cc,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Get database tickers
+        db_tickers = await get_database_tickers()
+        embed.add_field(
+            name="📊 Database Tickers",
+            value=f"**Count:** {len(db_tickers)}\n**Tickers:** {', '.join(db_tickers[:10])}{'...' if len(db_tickers) > 10 else ''}" if db_tickers else "No tickers stored in database",
+            inline=False
+        )
+        
+        # Get database VIP tickers
+        db_vip_tickers = await get_vip_tickers_from_database()
+        embed.add_field(
+            name="⭐ Database VIP Tickers",
+            value=f"**Count:** {len(db_vip_tickers)}\n**VIP Tickers:** {', '.join(db_vip_tickers)}" if db_vip_tickers else "No VIP tickers stored in database",
+            inline=False
+        )
+        
+        # Compare with current memory
+        global TICKERS
+        from priority_manager import priority_manager
+        
+        memory_tickers = set(TICKERS)
+        memory_vip = set(priority_manager.VIP_TICKERS)
+        db_ticker_set = set(db_tickers)
+        db_vip_set = set(db_vip_tickers)
+        
+        # Sync status
+        tickers_synced = memory_tickers == db_ticker_set
+        vip_synced = memory_vip == db_vip_set
+        
+        embed.add_field(
+            name="🔄 Sync Status",
+            value=f"""
+**Tickers Synced:** {'✅ Yes' if tickers_synced else '❌ No'}
+**VIP Synced:** {'✅ Yes' if vip_synced else '❌ No'}
+**Memory Tickers:** {len(memory_tickers)}
+**Database Tickers:** {len(db_ticker_set)}
+**Memory VIP:** {len(memory_vip)}
+**Database VIP:** {len(db_vip_set)}
+            """,
+            inline=False
+        )
+        
+        if not tickers_synced:
+            missing_in_db = memory_tickers - db_ticker_set
+            missing_in_memory = db_ticker_set - memory_tickers
+            if missing_in_db:
+                embed.add_field(
+                    name="⚠️ Missing in Database",
+                    value=f"Tickers: {', '.join(missing_in_db)}",
+                    inline=True
+                )
+            if missing_in_memory:
+                embed.add_field(
+                    name="⚠️ Missing in Memory",
+                    value=f"Tickers: {', '.join(missing_in_memory)}",
+                    inline=True
+                )
+        
+        if not vip_synced:
+            missing_vip_in_db = memory_vip - db_vip_set
+            missing_vip_in_memory = db_vip_set - memory_vip
+            if missing_vip_in_db:
+                embed.add_field(
+                    name="⚠️ VIP Missing in Database",
+                    value=f"VIP Tickers: {', '.join(missing_vip_in_db)}",
+                    inline=True
+                )
+            if missing_vip_in_memory:
+                embed.add_field(
+                    name="⚠️ VIP Missing in Memory", 
+                    value=f"VIP Tickers: {', '.join(missing_vip_in_memory)}",
+                    inline=True
+                )
+        
+        embed.add_field(
+            name="💡 Commands",
+            value="`!addticker SYMBOL` - Add and sync ticker\n`!priority vip add SYMBOL` - Add and sync VIP ticker\n`!dbsync` - Check sync status",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error checking database sync: {e}")
+
+@bot.command(name='bestperformers')
+async def best_performing_signals(ctx, days: int = 30):
+    """Show historically best performing signals based on analytics data
+    
+    Usage:
+    !bestperformers - Show 30-day best performers
+    !bestperformers 7 - Show 7-day best performers
+    !bestperformers 60 - Show 60-day best performers
+    """
+    try:
+        if days < 1 or days > 90:
+            await ctx.send("❌ Days must be between 1 and 90")
+            return
+            
+        # Send typing indicator for longer operation
+        async with ctx.typing():
+            best_performers = await get_best_performing_signals(days)
+            
+            if not best_performers or not best_performers.get('best_performers'):
+                await ctx.send(f"❌ No analytics data available for the last {days} days. Analytics are built over time as signals are detected.")
+                return
+                
+            embed = discord.Embed(
+                title=f"🏆 Best Performing Signals ({days} days)",
+                description="Top signal combinations based on utilization rate and priority",
+                color=0xffd700,
+                timestamp=datetime.now(EST)
+            )
+            
+            # Top performers
+            top_performers = best_performers.get('best_performers', [])[:10]
+            if top_performers:
+                performers_text = ""
+                for i, performer in enumerate(top_performers, 1):
+                    performers_text += f"{i}. **{performer['ticker']} {performer['system']} ({performer['timeframe']})**: {performer['utilization_rate']}% utilization, {performer['avg_priority']:.1f} avg priority\n"
+                
+                embed.add_field(
+                    name="🎯 Top Signal Combinations",
+                    value=performers_text[:1000],
+                    inline=False
+                )
+            
+            # Most active systems
+            active_systems = best_performers.get('most_active_systems', [])[:5]
+            if active_systems:
+                systems_text = ""
+                for system in active_systems:
+                    systems_text += f"**{system['system']}**: {system['total_signals']} signals, {system['avg_priority']:.1f} avg priority\n"
+                
+                embed.add_field(
+                    name="🏗️ Most Active Systems",
+                    value=systems_text,
+                    inline=True
+                )
+            
+            # Consistent performers
+            consistent = best_performers.get('consistent_performers', [])[:5]
+            if consistent:
+                consistent_text = ""
+                for ticker in consistent:
+                    consistent_text += f"**{ticker['ticker']}**: {ticker['avg_priority']:.1f} avg priority, {ticker['total_signals']} signals\n"
+                
+                embed.add_field(
+                    name="⭐ Consistent High-Priority Tickers",
+                    value=consistent_text,
+                    inline=True
+                )
+            
+            embed.set_footer(text="💡 Analytics are updated every 5 signal check cycles • Use !analytics for detection stats")
+            
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting best performers: {e}")
+
+@bot.command(name='performance')
+async def signal_performance_summary(ctx):
+    """Show overall signal performance summary from historical analytics"""
+    try:
+        # Send typing indicator
+        async with ctx.typing():
+            performance = await get_signal_performance_summary()
+            
+            if not performance or not performance.get('overall_stats'):
+                await ctx.send("❌ No historical analytics data available yet. Performance data is built over time as signals are detected.")
+                return
+                
+            embed = discord.Embed(
+                title="📈 Signal Performance Summary",
+                description="Historical performance analysis from analytics database",
+                color=0x00ff88,
+                timestamp=datetime.now(EST)
+            )
+            
+            # Overall stats
+            overall = performance.get('overall_stats', {})
+            if overall:
+                total_signals = overall.get('total_signals_all_time', 0)
+                total_sent = overall.get('total_sent_all_time', 0)
+                overall_avg = overall.get('overall_avg_priority', 0)
+                utilization_rate = (total_sent / max(total_signals, 1)) * 100
+                
+                embed.add_field(
+                    name="📊 All-Time Performance",
+                    value=f"""
+**Total Signals Detected:** {total_signals:,}
+**Total Notifications Sent:** {total_sent:,}
+**Overall Utilization Rate:** {utilization_rate:.1f}%
+**Average Priority Score:** {overall_avg:.1f}
+**Unique Tickers:** {overall.get('unique_tickers', 0)}
+**Signal Systems:** {overall.get('unique_systems', 0)}
+                    """,
+                    inline=False
+                )
+                
+                # Date range
+                earliest = overall.get('earliest_date')
+                latest = overall.get('latest_date')
+                if earliest and latest:
+                    embed.add_field(
+                        name="📅 Data Range",
+                        value=f"**From:** {earliest}\n**To:** {latest}",
+                        inline=True
+                    )
+            
+            # Recent stats (30 days)
+            recent = performance.get('recent_stats', {})
+            if recent:
+                recent_signals = recent.get('signals_30d', 0)
+                recent_sent = recent.get('sent_30d', 0)
+                recent_utilization = (recent_sent / max(recent_signals, 1)) * 100
+                
+                embed.add_field(
+                    name="📈 Last 30 Days",
+                    value=f"""
+**Signals:** {recent_signals}
+**Sent:** {recent_sent}
+**Utilization:** {recent_utilization:.1f}%
+**Avg Priority:** {recent.get('avg_priority_30d', 0):.1f}
+**Active Days:** {recent.get('active_days_30d', 0)}
+                    """,
+                    inline=True
+                )
+            
+            # Top system
+            top_system = performance.get('top_system', {})
+            if top_system:
+                embed.add_field(
+                    name="🏆 Top System",
+                    value=f"""
+**System:** {top_system.get('system', 'Unknown')}
+**Total Signals:** {top_system.get('total_signals', 0)}
+**Avg Priority:** {top_system.get('avg_priority', 0):.1f}
+                    """,
+                    inline=True
+                )
+            
+            # Top ticker
+            top_ticker = performance.get('top_ticker', {})
+            if top_ticker:
+                embed.add_field(
+                    name="⭐ Most Reliable Ticker",
+                    value=f"""
+**Ticker:** {top_ticker.get('ticker', 'Unknown')}
+**Utilization Rate:** {top_ticker.get('utilization_rate', 0)}%
+**Avg Priority:** {top_ticker.get('avg_priority', 0):.1f}
+**Total Signals:** {top_ticker.get('total_signals', 0)}
+                    """,
+                    inline=True
+                )
+            
+            embed.set_footer(text="💡 Use !bestperformers for detailed analysis • !analytics for recent trends")
+            
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting performance summary: {e}")
+
+@bot.command(name='updateanalytics')
+async def manual_analytics_update(ctx, date: str = None):
+    """Manually update daily analytics for a specific date or today
+    
+    Usage:
+    !updateanalytics - Update analytics for today
+    !updateanalytics 2024-01-15 - Update analytics for specific date
+    """
+    try:
+        # Validate date format if provided
+        if date:
+            try:
+                datetime.strptime(date, '%Y-%m-%d')
+            except ValueError:
+                await ctx.send("❌ Invalid date format. Use YYYY-MM-DD (e.g., 2024-01-15)")
+                return
+        
+        # Send typing indicator
+        async with ctx.typing():
+            success = await update_daily_analytics(date)
+            
+            if success:
+                target_date = date if date else "today"
+                embed = discord.Embed(
+                    title="✅ Analytics Updated",
+                    description=f"Successfully updated daily analytics for {target_date}",
+                    color=0x00ff00,
+                    timestamp=datetime.now(EST)
+                )
+                embed.add_field(
+                    name="📊 What was updated",
+                    value="• Signal detection counts\n• Priority distributions\n• System performance\n• Ticker analytics",
+                    inline=False
+                )
+            else:
+                embed = discord.Embed(
+                    title="❌ Analytics Update Failed",
+                    description="Failed to update daily analytics",
+                    color=0xff0000,
+                    timestamp=datetime.now(EST)
+                )
+                embed.add_field(
+                    name="💡 Possible reasons",
+                    value="• No signals detected for the date\n• Database connection issue\n• Invalid date format",
+                    inline=False
+                )
+            
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error updating analytics: {e}")
+
 if __name__ == "__main__":
     import asyncio
     import sys
@@ -3240,4 +3651,4 @@ if __name__ == "__main__":
     except discord.LoginFailure:
         print("❌ Invalid Discord token")
     except Exception as e:
-        print(f"❌ Error starting bot: {e}") 
+        print(f"❌ Error starting bot: {e}")
