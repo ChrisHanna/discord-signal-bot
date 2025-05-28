@@ -1047,7 +1047,11 @@ async def on_ready():
     if db_success:
         print("✅ Database connection established successfully")
         
-        # ✅ NEW: Sync VIP tickers with database
+        # ✅ NEW: Sync ticker list with database first
+        await sync_tickers_with_database()
+        build_ticker_combinations()  # Rebuild combinations with updated ticker list
+        
+        # ✅ EXISTING: Sync VIP tickers with database
         print("🎯 Syncing priority manager with database...")
         await priority_manager.sync_with_database()
         print("✅ Priority manager synchronized with database")
@@ -2066,7 +2070,8 @@ async def add_ticker_command(ctx, ticker: str):
         embed.add_field(
             name="📊 Current Status", 
             value=f"Monitoring **{len(TICKERS)}** tickers across **{len(TIMEFRAMES)}** timeframes\n"
-                  f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**",
+                  f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
+                  f"**Active immediately** - no restart required",
             inline=False
         )
         embed.add_field(
@@ -3945,6 +3950,42 @@ async def help_command(ctx):
     embed.set_footer(text="💡 Use [OPTIONAL] for optional parameters • All commands start with !")
     
     await ctx.send(embed=embed)
+
+# ✅ NEW: Function to sync tickers with database on startup
+async def sync_tickers_with_database():
+    """Sync ticker list with PostgreSQL database on startup"""
+    global TICKERS, ticker_config
+    try:
+        print("🔄 Syncing ticker list with PostgreSQL database...")
+        
+        # Get tickers from database
+        db_tickers = await get_database_tickers()
+        
+        if db_tickers:
+            print(f"📊 Found {len(db_tickers)} tickers in database: {', '.join(db_tickers[:10])}{'...' if len(db_tickers) > 10 else ''}")
+            
+            # Update config with database tickers
+            ticker_config['tickers'] = sorted(list(set(db_tickers)))  # Remove duplicates and sort
+            save_ticker_config(ticker_config)
+            
+            # Update global TICKERS variable
+            TICKERS = ticker_config['tickers']
+            
+            print(f"✅ Ticker list synchronized: now monitoring {len(TICKERS)} tickers")
+            return True
+        else:
+            print("⚠️ No tickers found in database, using config file tickers")
+            
+            # If database is empty, populate it with current config tickers
+            for ticker in TICKERS:
+                await add_ticker_to_database(ticker)
+            print(f"📊 Populated database with {len(TICKERS)} tickers from config")
+            return True
+            
+    except Exception as e:
+        print(f"❌ Error syncing tickers with database: {e}")
+        print("⚠️ Continuing with config file tickers")
+        return False
 
 if __name__ == "__main__":
     import asyncio
