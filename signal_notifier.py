@@ -1121,11 +1121,15 @@ async def signal_check_loop():
         
         # ✅ NEW: Update daily analytics (every 5 cycles)
         if checks_completed % 5 == 0:
-            analytics_success = await update_daily_analytics()
-            if analytics_success:
-                print(f"📊 Updated daily analytics for today")
-            else:
-                print(f"⚠️ Failed to update daily analytics")
+            try:
+                analytics_success = await update_daily_analytics()
+                if analytics_success:
+                    print(f"📊 Updated daily analytics for today")
+                else:
+                    print(f"⚠️ Failed to update daily analytics")
+            except Exception as e:
+                print(f"❌ Error updating analytics (non-critical): {e}")
+                # Don't let analytics errors break the main signal checking loop
         
         # Check each ticker across all timeframes
         api_errors = 0
@@ -2747,19 +2751,30 @@ async def priority_statistics(ctx):
             )
             
             # Priority distribution
-            priority_dist = recent_notifications.get('priority_distribution', {})
-            if priority_dist:
-                embed.add_field(
-                    name="Priority Distribution (24h)",
-                    value=f"""
-🚨 **Critical:** {priority_dist.get('critical', 0)}
-⚠️ **High:** {priority_dist.get('high', 0)}
-📊 **Medium:** {priority_dist.get('medium', 0)}
-📢 **Low:** {priority_dist.get('low', 0)}
-📝 **Minimal:** {priority_dist.get('minimal', 0)}
-                    """,
-                    inline=True
-                )
+            priority_dist_raw = recent_notifications.get('priority_distribution', {})
+            if priority_dist_raw:
+                # Handle both dict and JSON string formats
+                if isinstance(priority_dist_raw, str):
+                    try:
+                        import json
+                        priority_dist = json.loads(priority_dist_raw)
+                    except json.JSONDecodeError:
+                        priority_dist = {}
+                else:
+                    priority_dist = priority_dist_raw
+                    
+                if priority_dist:
+                    embed.add_field(
+                        name="Priority Distribution (24h)",
+                        value=f"""
+🚨 **Critical:** {priority_dist.get('CRITICAL', 0)}
+⚠️ **High:** {priority_dist.get('HIGH', 0)}
+📊 **Medium:** {priority_dist.get('MEDIUM', 0)}
+📢 **Low:** {priority_dist.get('LOW', 0)}
+📝 **Minimal:** {priority_dist.get('MINIMAL', 0)}
+                        """,
+                        inline=True
+                    )
         
         embed.add_field(
             name="Priority Thresholds",
@@ -3166,11 +3181,15 @@ async def smart_signal_check(cycle_count: int, is_priority: bool, reason: str):
         
         # ✅ NEW: Update daily analytics (every 5 cycles)
         if cycle_count % 5 == 0:
-            analytics_success = await update_daily_analytics()
-            if analytics_success:
-                print(f"📊 Updated daily analytics for today")
-            else:
-                print(f"⚠️ Failed to update daily analytics")
+            try:
+                analytics_success = await update_daily_analytics()
+                if analytics_success:
+                    print(f"📊 Updated daily analytics for today")
+                else:
+                    print(f"⚠️ Failed to update daily analytics")
+            except Exception as e:
+                print(f"❌ Error updating analytics (non-critical): {e}")
+                # Don't let analytics errors break the main signal checking loop
         
         # Check each ticker across all timeframes
         api_errors = 0
@@ -3619,6 +3638,340 @@ async def manual_analytics_update(ctx, date: str = None):
         
     except Exception as e:
         await ctx.send(f"❌ Error updating analytics: {e}")
+
+@bot.command(name='analyticshealth')
+async def analytics_health_check(ctx):
+    """Check the health and status of the analytics system"""
+    try:
+        embed = discord.Embed(
+            title="🔬 Analytics System Health Check",
+            description="Comprehensive status of the analytics and database system",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Test database connection and table existence
+        try:
+            stats = await get_stats()
+            db_connection = "✅ Connected"
+        except Exception as e:
+            db_connection = f"❌ Error: {str(e)[:50]}"
+            stats = {}
+        
+        # Test analytics functions
+        analytics_functions = {}
+        
+        # Test update_daily_analytics
+        try:
+            await update_daily_analytics()
+            analytics_functions['update_daily_analytics'] = "✅ Working"
+        except Exception as e:
+            analytics_functions['update_daily_analytics'] = f"❌ Error: {str(e)[:30]}"
+        
+        # Test get_best_performing_signals
+        try:
+            await get_best_performing_signals(7)
+            analytics_functions['best_performers'] = "✅ Working"
+        except Exception as e:
+            analytics_functions['best_performers'] = f"❌ Error: {str(e)[:30]}"
+        
+        # Test get_signal_performance_summary
+        try:
+            await get_signal_performance_summary()
+            analytics_functions['performance_summary'] = "✅ Working"
+        except Exception as e:
+            analytics_functions['performance_summary'] = f"❌ Error: {str(e)[:30]}"
+        
+        # Database status
+        embed.add_field(
+            name="🗄️ Database Status",
+            value=f"""
+**Connection:** {db_connection}
+**Total Notifications:** {stats.get('total_notifications', 0)}
+**Total Detected:** {stats.get('total_detected', 0)}
+**Utilization Rate:** {stats.get('utilization_rate_24h', 0)}%
+            """,
+            inline=False
+        )
+        
+        # Analytics functions status
+        functions_text = ""
+        for func, status in analytics_functions.items():
+            functions_text += f"**{func}:** {status}\n"
+        
+        embed.add_field(
+            name="📊 Analytics Functions",
+            value=functions_text,
+            inline=False
+        )
+        
+        # Data freshness check
+        current_time = datetime.now(EST)
+        if last_successful_check:
+            time_since_last = current_time - last_successful_check
+            if time_since_last.total_seconds() < 3600:  # Less than 1 hour
+                data_freshness = f"✅ Fresh ({time_since_last.total_seconds()//60:.0f}m ago)"
+            else:
+                data_freshness = f"⚠️ Stale ({time_since_last.total_seconds()//3600:.1f}h ago)"
+        else:
+            data_freshness = "❌ Unknown"
+        
+        embed.add_field(
+            name="📅 Data Freshness",
+            value=f"**Last Signal Check:** {data_freshness}",
+            inline=True
+        )
+        
+        # Analytics integration status
+        analytics_integration = "✅ Enabled" if checks_completed % 5 == 0 else "✅ Scheduled"
+        embed.add_field(
+            name="🔄 Analytics Integration",
+            value=f"**Auto-Updates:** {analytics_integration}\n**Update Frequency:** Every 5 cycles",
+            inline=True
+        )
+        
+        # Overall health score
+        working_functions = sum(1 for status in analytics_functions.values() if "✅" in status)
+        total_functions = len(analytics_functions)
+        health_score = (working_functions / total_functions) * 100
+        
+        if health_score == 100:
+            health_status = "🟢 Excellent"
+            embed.color = 0x00ff00
+        elif health_score >= 75:
+            health_status = "🟡 Good"
+            embed.color = 0xffff00
+        else:
+            health_status = "🔴 Issues Detected"
+            embed.color = 0xff0000
+        
+        embed.add_field(
+            name="🏥 Overall Health",
+            value=f"**Status:** {health_status}\n**Score:** {health_score:.0f}%\n**Functions Working:** {working_functions}/{total_functions}",
+            inline=False
+        )
+        
+        embed.set_footer(text="💡 Use !updateanalytics to manually update • !performance for historical data")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error running analytics health check: {e}")
+
+@bot.command(name='help')
+async def help_command(ctx):
+    """Show all available bot commands organized by category"""
+    embed = discord.Embed(
+        title="🤖 Discord Signal Bot - Command Reference",
+        description="Complete list of available commands organized by category",
+        color=0x0099ff,
+        timestamp=datetime.now(EST)
+    )
+    
+    # Signal Commands
+    embed.add_field(
+        name="📊 Signal Commands",
+        value="""
+`!signals [TICKER] [TIMEFRAME]` - Get latest signals
+`!test` - Test API connection
+`!timer` - Show time until next check
+`!schedule` - Show smart scheduler info
+        """,
+        inline=False
+    )
+    
+    # Analytics Commands
+    embed.add_field(
+        name="📈 Analytics Commands",
+        value="""
+`!analytics [DAYS]` - Signal analytics & trends
+`!performance` - Overall performance summary
+`!bestperformers [DAYS]` - Top performing signals
+`!utilization` - Signal utilization analysis
+`!missed [HOURS]` - High-priority missed signals
+`!signalreport` - Comprehensive signal report
+`!updateanalytics [DATE]` - Manual analytics update
+`!analyticshealth` - Analytics system health check
+        """,
+        inline=False
+    )
+    
+    # Configuration Commands
+    embed.add_field(
+        name="⚙️ Configuration Commands",
+        value="""
+`!config` - Show current configuration
+`!addticker SYMBOL` - Add ticker to watchlist
+`!removeticker SYMBOL` - Remove ticker from watchlist
+`!listtickers` - List all monitored tickers
+`!timeframes [ACTION] [TF]` - Manage timeframes
+`!dbsync` - Database synchronization status
+        """,
+        inline=False
+    )
+    
+    # Priority Commands
+    embed.add_field(
+        name="🎯 Priority Management",
+        value="""
+`!priority` - Show priority settings
+`!priority level LEVEL` - Set minimum priority
+`!priority vip add TICKER` - Add VIP ticker
+`!priority vip remove TICKER` - Remove VIP ticker
+`!priority test TICKER` - Test priority scoring
+`!prioritystats` - Priority statistics
+        """,
+        inline=False
+    )
+    
+    # Status & Health Commands
+    embed.add_field(
+        name="🏥 Status & Health",
+        value="""
+`!status` - Bot status overview
+`!health` - Comprehensive health check
+`!uptime` - Bot uptime information
+`!notifications` - Notification statistics
+`!scheduler [ACTION]` - Control scheduler
+        """,
+        inline=False
+    )
+    
+    # Utility Commands
+    embed.add_field(
+        name="🛠️ Utility Commands",
+        value="""
+`!cleanup` - Manual database cleanup
+`!clear [AMOUNT]` - Clear channel messages
+`!watch TICKER` - Add ticker (legacy)
+`!help` - Show this help message
+        """,
+        inline=False
+    )
+    
+    # Footer with important info
+    embed.set_footer(text="💡 Use [OPTIONAL] for optional parameters • All commands start with !")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='analyticshealth')
+async def analytics_health_check(ctx):
+    """Check the health and status of the analytics system"""
+    try:
+        embed = discord.Embed(
+            title="🔬 Analytics System Health Check",
+            description="Comprehensive status of the analytics and database system",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Test database connection and table existence
+        try:
+            stats = await get_stats()
+            db_connection = "✅ Connected"
+        except Exception as e:
+            db_connection = f"❌ Error: {str(e)[:50]}"
+            stats = {}
+        
+        # Test analytics functions
+        analytics_functions = {}
+        
+        # Test update_daily_analytics
+        try:
+            await update_daily_analytics()
+            analytics_functions['update_daily_analytics'] = "✅ Working"
+        except Exception as e:
+            analytics_functions['update_daily_analytics'] = f"❌ Error: {str(e)[:30]}"
+        
+        # Test get_best_performing_signals
+        try:
+            await get_best_performing_signals(7)
+            analytics_functions['best_performers'] = "✅ Working"
+        except Exception as e:
+            analytics_functions['best_performers'] = f"❌ Error: {str(e)[:30]}"
+        
+        # Test get_signal_performance_summary
+        try:
+            await get_signal_performance_summary()
+            analytics_functions['performance_summary'] = "✅ Working"
+        except Exception as e:
+            analytics_functions['performance_summary'] = f"❌ Error: {str(e)[:30]}"
+        
+        # Database status
+        embed.add_field(
+            name="🗄️ Database Status",
+            value=f"""
+**Connection:** {db_connection}
+**Total Notifications:** {stats.get('total_notifications', 0)}
+**Total Detected:** {stats.get('total_detected', 0)}
+**Utilization Rate:** {stats.get('utilization_rate_24h', 0)}%
+            """,
+            inline=False
+        )
+        
+        # Analytics functions status
+        functions_text = ""
+        for func, status in analytics_functions.items():
+            functions_text += f"**{func}:** {status}\n"
+        
+        embed.add_field(
+            name="📊 Analytics Functions",
+            value=functions_text,
+            inline=False
+        )
+        
+        # Data freshness check
+        current_time = datetime.now(EST)
+        if last_successful_check:
+            time_since_last = current_time - last_successful_check
+            if time_since_last.total_seconds() < 3600:  # Less than 1 hour
+                data_freshness = f"✅ Fresh ({time_since_last.total_seconds()//60:.0f}m ago)"
+            else:
+                data_freshness = f"⚠️ Stale ({time_since_last.total_seconds()//3600:.1f}h ago)"
+        else:
+            data_freshness = "❌ Unknown"
+        
+        embed.add_field(
+            name="📅 Data Freshness",
+            value=f"**Last Signal Check:** {data_freshness}",
+            inline=True
+        )
+        
+        # Analytics integration status
+        analytics_integration = "✅ Enabled" if checks_completed % 5 == 0 else "✅ Scheduled"
+        embed.add_field(
+            name="🔄 Analytics Integration",
+            value=f"**Auto-Updates:** {analytics_integration}\n**Update Frequency:** Every 5 cycles",
+            inline=True
+        )
+        
+        # Overall health score
+        working_functions = sum(1 for status in analytics_functions.values() if "✅" in status)
+        total_functions = len(analytics_functions)
+        health_score = (working_functions / total_functions) * 100
+        
+        if health_score == 100:
+            health_status = "🟢 Excellent"
+            embed.color = 0x00ff00
+        elif health_score >= 75:
+            health_status = "🟡 Good"
+            embed.color = 0xffff00
+        else:
+            health_status = "🔴 Issues Detected"
+            embed.color = 0xff0000
+        
+        embed.add_field(
+            name="🏥 Overall Health",
+            value=f"**Status:** {health_status}\n**Score:** {health_score:.0f}%\n**Functions Working:** {working_functions}/{total_functions}",
+            inline=False
+        )
+        
+        embed.set_footer(text="💡 Use !updateanalytics to manually update • !performance for historical data")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error running analytics health check: {e}")
 
 if __name__ == "__main__":
     import asyncio

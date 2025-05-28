@@ -215,6 +215,16 @@ class DatabaseManager:
                 ON signal_analytics(date DESC, ticker, system)
             ''')
             
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_detected_ticker_system
+                ON signals_detected(ticker, system, detected_at DESC)
+            ''')
+            
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_prefs_updated
+                ON user_preferences(updated_at DESC)
+            ''')
+            
             self.logger.info("✅ Database tables created/verified")
     
     async def record_detected_signal(self, ticker: str, timeframe: str, signal_type: str,
@@ -596,6 +606,17 @@ class DatabaseManager:
                     WHERE detected_at >= $1
                 ''', since_24h)
                 
+                # Convert priority distribution to JSON format
+                priority_distribution = {}
+                if priority_dist:
+                    priority_distribution = {
+                        'CRITICAL': priority_dist.get('critical', 0),
+                        'HIGH': priority_dist.get('high', 0),
+                        'MEDIUM': priority_dist.get('medium', 0),
+                        'LOW': priority_dist.get('low', 0),
+                        'MINIMAL': priority_dist.get('minimal', 0)
+                    }
+                
                 # Most active ticker
                 most_active = await conn.fetchrow('''
                     SELECT ticker, COUNT(*) as count 
@@ -621,7 +642,7 @@ class DatabaseManager:
                     'last_7d': last_7d,
                     'detected_24h': detected_24h,
                     'utilization_rate_24h': round((last_24h / max(detected_24h, 1)) * 100, 1),
-                    'priority_distribution': json.dumps({item['priority_level']: item['count'] for item in priority_dist}) if priority_dist else {},
+                    'priority_distribution': json.dumps(priority_distribution) if priority_distribution else {},
                     'most_active_ticker': dict(most_active) if most_active else None,
                     'most_common_signal': dict(most_common) if most_common else None
                 }
