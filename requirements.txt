@@ -1,5 +1,47 @@
+# Discord Signal Bot - Enhanced Priority System
+# Core Dependencies
+
+# Discord Bot Framework
 discord.py>=2.3.0
-requests>=2.31.0
+
+# Database Connectivity
+asyncpg>=0.28.0
+
+# Environment Configuration
 python-dotenv>=1.0.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Date/Time Handling
+python-dateutil>=2.8.0
+
+# HTTP Requests (if needed for external APIs)
 aiohttp>=3.8.0
-pytz>=2023.3 
+requests>=2.31.0
+
+# JSON Processing (usually built-in, but explicit for clarity)
+# json - built-in module
+
+# Async Support
+asyncio>=3.4.3
+
+# Optional: Enhanced Logging
+colorlog>=6.7.0
+
+# Optional: Performance Monitoring
+psutil>=5.9.0
+
+# Optional: Data Visualization (for analytics)
+matplotlib>=3.7.0
+plotly>=5.15.0
+
+# Development Dependencies (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Note: Some packages like 'os', 'sys', 'datetime', 'logging' are built-in Python modules
+# and don't need to be installed via pip 

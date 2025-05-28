@@ -8,21 +8,35 @@ import requests
 import json
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import pytz
 import threading
-# from http.server import HTTPServer, BaseHTTPRequestHandler  # Commented out - health check disabled
+import asyncio
+import aiohttp
+import sys
+import traceback
+import atexit
+from dateutil import parser
+import logging
+
+# Import database functionality
+from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization
+from priority_manager import should_send_notification, get_priority_display, calculate_signal_priority, rank_signals_by_priority, priority_manager
+
+# Import smart scheduler
+from smart_scheduler import SmartScheduler, create_smart_scheduler
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
 API_BASE_URL = os.getenv('API_BASE_URL', 'http://localhost:5000')
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1600'))  # Default ~26 minutes
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1600'))  # Default ~26 minutes (kept for compatibility)
+USE_SMART_SCHEDULER = os.getenv('USE_SMART_SCHEDULER', 'true').lower() == 'true'  # Enable smart scheduling
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 
@@ -214,6 +228,7 @@ loop_start_time = None
 checks_completed = 0
 bot_start_time = None
 last_successful_check = None
+smart_scheduler = None  # Smart scheduler instance
 health_stats = {
     'total_signals_found': 0,
     'total_notifications_sent': 0,
@@ -225,105 +240,12 @@ health_stats = {
 class SignalNotifier:
     def __init__(self, bot):
         self.bot = bot
-        self.last_notifications = self.load_last_notifications()
-        
-    def load_last_notifications(self) -> Dict:
-        """Load the last notification timestamps from file with cleanup"""
-        try:
-            if os.path.exists(LAST_NOTIFICATION_FILE):
-                with open(LAST_NOTIFICATION_FILE, 'r') as f:
-                    data = json.load(f)
-                
-                # Clean up old entries (older than 7 days) to prevent infinite growth
-                current_time = datetime.now()
-                cleaned_data = {}
-                cleaned_count = 0
-                
-                for key, timestamp_str in data.items():
-                    try:
-                        # Try to parse as ISO format first (new format)
-                        if 'T' in timestamp_str:
-                            timestamp = datetime.fromisoformat(timestamp_str)
-                        else:
-                            # Handle old format (date only) - assume it's from today
-                            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d')
-                        
-                        # Keep entries that are less than 7 days old
-                        if (current_time - timestamp).days < 7:
-                            cleaned_data[key] = timestamp_str
-                        else:
-                            cleaned_count += 1
-                    except (ValueError, TypeError):
-                        # Remove malformed entries
-                        cleaned_count += 1
-                        continue
-                
-                if cleaned_count > 0:
-                    print(f"🧹 Cleaned up {cleaned_count} old notification entries")
-                    # Save the cleaned data back to file
-                    self._save_notifications_atomic(cleaned_data)
-                
-                return cleaned_data
-        except Exception as e:
-            print(f"⚠️ Error loading last notifications: {e}")
-        return {}
-    
-    def _save_notifications_atomic(self, data: Dict):
-        """Save notifications with atomic write to prevent corruption"""
-        temp_file = LAST_NOTIFICATION_FILE + '.tmp'
-        try:
-            # Write to temporary file first
-            with open(temp_file, 'w') as f:
-                json.dump(data, f, indent=2, sort_keys=True)
-            
-            # Atomic move (rename) - this is atomic on most filesystems
-            import shutil
-            shutil.move(temp_file, LAST_NOTIFICATION_FILE)
-            
-        except Exception as e:
-            print(f"❌ Error saving notifications atomically: {e}")
-            # Clean up temp file if it exists
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-    
-    def save_last_notifications(self):
-        """Save the last notification timestamps to file with atomic write"""
-        try:
-            self._save_notifications_atomic(self.last_notifications)
-        except Exception as e:
-            print(f"❌ Error saving last notifications: {e}")
-    
-    def cleanup_old_notifications(self):
-        """Manually trigger cleanup of old notifications (can be called periodically)"""
-        current_time = datetime.now()
-        cleaned_data = {}
-        cleaned_count = 0
-        
-        for key, timestamp_str in self.last_notifications.items():
-            try:
-                if 'T' in timestamp_str:
-                    timestamp = datetime.fromisoformat(timestamp_str)
-                else:
-                    timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d')
-                
-                # Keep entries that are less than 7 days old
-                if (current_time - timestamp).days < 7:
-                    cleaned_data[key] = timestamp_str
-                else:
-                    cleaned_count += 1
-            except (ValueError, TypeError):
-                cleaned_count += 1
-                continue
-        
-        if cleaned_count > 0:
-            print(f"🧹 Cleaned up {cleaned_count} old notification entries from memory")
-            self.last_notifications = cleaned_data
-            self.save_last_notifications()
-        
-        return cleaned_count
+        # No longer need to load JSON notifications - database handles this
+        self.stats = {
+            'signals_sent': 0,
+            'api_calls': 0,
+            'errors': 0
+        }
     
     def fetch_signal_timeline(self, ticker: str, timeframe: str = '1d') -> Optional[List[Dict]]:
         """Fetch signal timeline data from your web API"""
@@ -828,146 +750,108 @@ class SignalNotifier:
                 print(f"📅 Filtering for signals within last {max_days_ago} days")
             
             for signal in signals:
-                signal_date = signal.get('date', '')
-                if not signal_date:
+                signal_date_str = signal.get('date', '')
+                if not signal_date_str:
                     continue
                 
                 try:
-                    # Parse signal timestamp
-                    if ' ' in signal_date:
-                        # Full timestamp (1h data)
-                        parsed_signal_time = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
+                    # Handle different date formats
+                    if ' ' in signal_date_str:
+                        signal_datetime = datetime.strptime(signal_date_str, '%Y-%m-%d %H:%M:%S')
                     else:
-                        # Date only (1d data) - assume market open time
-                        parsed_signal_time = datetime.strptime(signal_date, '%Y-%m-%d')
+                        signal_datetime = datetime.strptime(signal_date_str, '%Y-%m-%d')
+                        # For daily signals, set time to market close (4 PM EST)
+                        signal_datetime = signal_datetime.replace(hour=16)
                     
-                    # Calculate time difference
-                    time_diff = current_datetime - parsed_signal_time
+                    # Calculate age of signal
+                    time_diff = current_datetime - signal_datetime
                     
-                    # Apply timeframe-specific filtering
                     if timeframe == '1h':
-                        # For 1h timeframe: only signals within last 4 hours
-                        if time_diff.total_seconds() <= (max_hours_ago * 3600):
-                            recent_signals.append(signal)
+                        is_recent = time_diff.total_seconds() <= (max_hours_ago * 3600)
                     else:
-                        # For 1d timeframe: only signals within last 7 days
-                        if time_diff.days <= max_days_ago:
-                            recent_signals.append(signal)
-                            
-                except ValueError as e:
-                    print(f"⚠️ Error parsing signal date '{signal_date}': {e}")
+                        is_recent = time_diff.days <= max_days_ago
+                    
+                    if is_recent:
+                        signal['age_hours'] = time_diff.total_seconds() / 3600
+                        recent_signals.append(signal)
+                        
+                        # Enhanced debug info
+                        age_str = f"{time_diff.total_seconds()/3600:.1f}h" if timeframe == '1h' else f"{time_diff.days}d"
+                        print(f"   ✅ {signal.get('type', 'Unknown')} ({signal.get('strength', 'Unknown')}) - {age_str} ago")
+                    
+                except Exception as e:
+                    print(f"⚠️ Error parsing signal date '{signal_date_str}': {e}")
                     continue
             
-            print(f"✅ Found {len(recent_signals)} recent signals for {ticker} ({timeframe})")
+            print(f"📊 Found {len(recent_signals)} recent signals out of {len(signals)} total")
             return recent_signals
             
         except Exception as e:
             print(f"❌ Error checking for new signals: {e}")
             return []
-    
-    def should_notify(self, signal: Dict, ticker: str, timeframe: str) -> bool:
-        """Enhanced signal filtering for notifications with duplicate prevention"""
+
+    async def should_notify(self, signal: Dict, ticker: str, timeframe: str) -> bool:
+        """Enhanced signal filtering with priority-based notification system and comprehensive tracking"""
         if not signal:
             return False
         
-        # Create unique notification key
-        signal_key = f"{ticker}_{timeframe}_{signal.get('type', '')}_{signal.get('date', '')}"
-        
-        # Check if we've already notified about this signal
-        if signal_key in self.last_notifications:
-            last_notified = self.last_notifications[signal_key]
-            try:
-                last_notified_time = datetime.fromisoformat(last_notified)
-                # Don't notify again if we've notified within the last 24 hours
-                if (datetime.now() - last_notified_time).total_seconds() < 86400:  # 24 hours
-                    return False
-            except (ValueError, TypeError):
-                # If there's an issue parsing the date, remove the old entry and proceed
-                del self.last_notifications[signal_key]
-        
-        # Check if signal is recent enough based on timeframe
+        # Check if we've already sent this notification using the database
         signal_date = signal.get('date', '')
-        if not signal_date:
+        signal_type = signal.get('type', '')
+        strength = signal.get('strength', 'Unknown')
+        system = signal.get('system', 'Unknown')
+        
+        if not signal_date or not signal_type:
             return False
         
-        try:
-            current_datetime = datetime.now()
-            
-            # Parse signal timestamp
-            if ' ' in signal_date:
-                # Full timestamp (1h data)
-                parsed_signal_time = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
-            else:
-                # Date only (1d data)
-                parsed_signal_time = datetime.strptime(signal_date, '%Y-%m-%d')
-            
-            # Calculate time difference
-            time_diff = current_datetime - parsed_signal_time
-            
-            # Apply timeframe-specific filtering
-            if timeframe == '1h':
-                # For 1h timeframe: only signals within last 4 hours
-                if time_diff.total_seconds() > (4 * 3600):  # 4 hours in seconds
-                    return False
-            else:
-                # For 1d timeframe: only signals within last 3 days
-                if time_diff.days > 3:
-                    return False
-                    
-        except ValueError:
-            # If we can't parse the date, fall back to daysSince
-            days_since = signal.get('daysSince')
-            if days_since is None or not isinstance(days_since, (int, float)):
-                return False
-            
-            if timeframe == '1h':
-                # For hourly, be very strict - only today's signals
-                if days_since > 0:
-                    return False
-            else:
-                # For daily, allow up to 3 days
-                if days_since > 3:
-                    return False
+        # Calculate priority score first
+        should_send, priority_score = should_send_notification(signal, ticker, timeframe)
         
-        # Filter by signal strength and type
-        strength = signal.get('strength', '').lower()
-        signal_type = signal.get('type', '').lower()
-        system = signal.get('system', '').lower()
+        # Check for duplicate in database
+        is_duplicate = await check_duplicate(ticker, timeframe, signal_type, signal_date)
         
-        # High priority signals that should always notify
-        high_priority_signals = [
-            'gold buy', 'wt gold buy signal', 'volume explosion',
-            'price breakout', 'weekly surge', 'exhaustion'
-        ]
+        # Determine skip reason and whether to send
+        skip_reason = None
+        will_send = False
         
-        # Strong signals that should notify
-        strong_signals = [
-            'buy signal', 'wt buy signal', 'bullish', 'oversold reversal',
-            'volume breakout'
-        ]
+        if is_duplicate:
+            skip_reason = "duplicate_notification"
+        elif not should_send:
+            skip_reason = f"priority_below_threshold_{priority_score.priority_level.name.lower()}"
+        else:
+            will_send = True
         
-        # Check for high priority signals
-        if any(priority in signal_type for priority in high_priority_signals):
-            return True
+        # Record EVERY signal we detect in the database for analytics
+        await record_detected_signal(
+            ticker=ticker,
+            timeframe=timeframe, 
+            signal_type=signal_type,
+            signal_date=signal_date,
+            strength=strength,
+            system=system,
+            priority_score=priority_score.total_score,
+            priority_level=priority_score.priority_level.name,
+            was_sent=will_send,
+            skip_reason=skip_reason,
+            signal_data={
+                'base_score': priority_score.base_score,
+                'strength_bonus': priority_score.strength_bonus,
+                'system_bonus': priority_score.system_bonus,
+                'ticker_bonus': priority_score.ticker_bonus,
+                'timeframe_bonus': priority_score.timeframe_bonus,
+                'urgency_bonus': priority_score.urgency_bonus,
+                'pattern_bonus': priority_score.pattern_bonus,
+                'is_vip_ticker': ticker in priority_manager.VIP_TICKERS,
+                'is_vip_timeframe': timeframe in priority_manager.VIP_TIMEFRAMES
+            }
+        )
         
-        # Check for strong signals with good strength
-        if any(strong in signal_type for strong in strong_signals):
-            if strength in ['strong', 'very strong']:
-                return True
+        if will_send:
+            print(f"🎯 Priority notification: {ticker} {signal_type} - Priority: {priority_score.priority_level.name} (Score: {priority_score.total_score})")
+        else:
+            print(f"⏸️ Skipped signal: {ticker} {signal_type} - Priority: {priority_score.priority_level.name} (Score: {priority_score.total_score}) - Reason: {skip_reason}")
         
-        # RSI3M3+ bullish entries are always important
-        if 'rsi3m3' in system and 'bullish' in signal_type:
-            return True
-        
-        # RSI3M3+ bearish entries are also always important
-        if 'rsi3m3' in system and 'bearish' in signal_type:
-            return True
-        
-        # Money flow divergences with strong strength
-        if 'money flow' in system and strength == 'strong':
-            return True
-        
-        return False
+        return will_send
     
     def format_signal_for_discord(self, signal: Dict, ticker: str, timeframe: str = '1d') -> str:
         """Format a signal for Discord notification with EST timestamps"""
@@ -1056,28 +940,33 @@ class SignalNotifier:
         """.strip()
 
     async def send_signal_notification(self, signal: Dict, ticker: str, timeframe: str):
-        """Send a signal notification to Discord"""
+        """Send a signal notification to Discord with priority information"""
         try:
             channel = self.bot.get_channel(CHANNEL_ID)
             if not channel:
-                print(f"❌ Could not find channel with ID {CHANNEL_ID}")
+                print(f"❌ Channel {CHANNEL_ID} not found")
                 return
+            
+            # Calculate priority score for display
+            priority_score = calculate_signal_priority(signal, ticker, timeframe)
+            priority_display = get_priority_display(priority_score)
             
             # Format the signal message
             message = self.format_signal_for_discord(signal, ticker, timeframe)
             
-            # Determine embed color based on signal type
-            signal_type = signal.get('type', '').lower()
-            if 'gold buy' in signal_type:
-                color = 0xFFD700  # Gold
-            elif 'buy' in signal_type or 'bullish' in signal_type:
-                color = 0x00ff00  # Green
-            elif 'sell' in signal_type or 'bearish' in signal_type:
-                color = 0xff0000  # Red
-            elif 'exhaustion' in signal_type:
-                color = 0xff6600  # Orange
-            else:
-                color = 0x0099ff  # Blue
+            # Add priority information to message
+            message += f"\n{priority_display}"
+            
+            # Determine embed color based on priority level
+            priority_colors = {
+                'CRITICAL': 0xFF0000,  # Red
+                'HIGH': 0xFF6600,      # Orange  
+                'MEDIUM': 0x0099FF,    # Blue
+                'LOW': 0x00FF00,       # Green
+                'MINIMAL': 0x808080    # Gray
+            }
+            
+            color = priority_colors.get(priority_score.priority_level.name, 0x0099ff)
             
             # Create Discord embed
             embed = discord.Embed(
@@ -1098,17 +987,42 @@ class SignalNotifier:
                 value=signal.get('strength', 'Unknown'), 
                 inline=True
             )
+            embed.add_field(
+                name="Priority Score",
+                value=f"{priority_score.total_score} ({priority_score.priority_level.name})",
+                inline=True
+            )
             
-            await channel.send(embed=embed)
-            print(f"📤 Sent notification: {ticker} ({timeframe}) - {signal.get('type', 'Unknown')}")
+            # Send message and get the message object
+            discord_message = await channel.send(embed=embed)
+            print(f"📤 Sent priority notification: {ticker} ({timeframe}) - {signal.get('type', 'Unknown')} [Priority: {priority_score.priority_level.name}]")
             
-            # Record this notification to prevent duplicates
-            signal_key = f"{ticker}_{timeframe}_{signal.get('type', '')}_{signal.get('date', '')}"
-            self.last_notifications[signal_key] = datetime.now().isoformat()
-            self.save_last_notifications()
+            # Record this notification in the database with enhanced priority tracking
+            success = await record_notification(
+                ticker=ticker,
+                timeframe=timeframe,
+                signal_type=signal.get('type', ''),
+                signal_date=signal.get('date', ''),
+                strength=signal.get('strength'),
+                system=signal.get('system'),
+                discord_message_id=discord_message.id,
+                priority_score=priority_score.total_score,
+                priority_level=priority_score.priority_level.name,
+                was_vip_ticker=ticker in priority_manager.VIP_TICKERS,
+                was_vip_timeframe=timeframe in priority_manager.VIP_TIMEFRAMES,
+                urgency_bonus=priority_score.urgency_bonus,
+                pattern_bonus=priority_score.pattern_bonus
+            )
+            
+            if success:
+                self.stats['signals_sent'] += 1
+                print(f"💾 Recorded notification in database")
+            else:
+                print(f"⚠️ Failed to record notification in database")
             
         except Exception as e:
             print(f"❌ Error sending notification: {e}")
+            self.stats['errors'] += 1
 
 def start_health_server():
     """Health check server temporarily disabled due to timezone issues"""
@@ -1122,12 +1036,23 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    global loop_start_time, bot_start_time
+    global loop_start_time, bot_start_time, smart_scheduler
     bot_start_time = datetime.now(EST)
     print(f'🤖 {bot.user} has connected to Discord!')
     print(f"🚀 Bot started at: {bot_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+    
+    # Initialize database connection
+    print("🗄️ Initializing database connection...")
+    db_success = await init_database()
+    if db_success:
+        print("✅ Database connection established successfully")
+    else:
+        print("❌ Failed to initialize database - notifications will not work properly")
+    
     print(f"📊 Monitoring {len(TICKER_TF_COMBINATIONS)} ticker-timeframe combinations")
-    print(f"⏰ Signal check interval: {CHECK_INTERVAL} seconds ({CHECK_INTERVAL/60:.1f} minutes)")
+    for ticker, tf in TICKER_TF_COMBINATIONS:
+        print(f"   • {ticker} ({tf})")
+    
     print(f"🌐 API endpoint: {API_BASE_URL}")
     print(f"📡 Discord channel: {CHANNEL_ID}")
     
@@ -1136,12 +1061,32 @@ async def on_ready():
         print(f"🚂 Running on Railway deployment: {os.getenv('RAILWAY_ENVIRONMENT')}")
         print(f"🔧 Railway service: {os.getenv('RAILWAY_SERVICE_NAME', 'discord-bot')}")
     
-    if not signal_check_loop.is_running():
+    # Initialize scheduler based on configuration
+    if USE_SMART_SCHEDULER:
+        print("🎯 Initializing Smart Scheduler...")
+        print("📅 Smart scheduling aligns signal checks with hourly candle closes")
+        
+        # Create smart scheduler with custom configuration
+        smart_scheduler = create_smart_scheduler(
+            signal_check_function=smart_signal_check,
+            logger=logging.getLogger(__name__)
+        )
+        
+        # Start the smart scheduler
+        smart_scheduler.start()
         loop_start_time = datetime.now(EST)
-        signal_check_loop.start()
-        print(f"✅ Signal monitoring loop started at: {loop_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+        print(f"✅ Smart Scheduler started at: {loop_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+        
     else:
-        print("⚠️ Signal monitoring loop was already running")
+        print("⏰ Using legacy fixed-interval scheduler...")
+        print(f"⏰ Signal check interval: {CHECK_INTERVAL} seconds ({CHECK_INTERVAL/60:.1f} minutes)")
+        
+        if not signal_check_loop.is_running():
+            loop_start_time = datetime.now(EST)
+            signal_check_loop.start()
+            print(f"✅ Signal monitoring loop started at: {loop_start_time.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+        else:
+            print("⚠️ Signal monitoring loop was already running")
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def signal_check_loop():
@@ -1191,7 +1136,11 @@ async def signal_check_loop():
                         print(f"✅ Found {len(recent_signals)} recent signals for {ticker} ({timeframe})")
                         
                         # Filter signals that should trigger notifications
-                        notify_signals = [s for s in recent_signals if notifier.should_notify(s, ticker, timeframe)]
+                        notify_signals = []
+                        for signal in recent_signals:
+                            should_notify_result = await notifier.should_notify(signal, ticker, timeframe)
+                            if should_notify_result:
+                                notify_signals.append(signal)
                         
                         if notify_signals:
                             print(f"🚨 {len(notify_signals)} signals meet notification criteria")
@@ -1455,60 +1404,276 @@ async def add_ticker(ctx, ticker: str):
 @bot.command(name='timer')
 async def show_timer(ctx):
     """Show time until next signal check"""
-    if not signal_check_loop.is_running():
-        await ctx.send("❌ Signal monitoring is not running")
-        return
-    
-    now = datetime.now(EST)  # Use timezone-aware datetime
-    
-    if loop_start_time:
-        # Calculate when the next iteration should happen
-        elapsed = (now - loop_start_time).total_seconds()
-        cycles_completed = int(elapsed // CHECK_INTERVAL)
-        next_cycle_time = loop_start_time + timedelta(seconds=(cycles_completed + 1) * CHECK_INTERVAL)
-        time_until_next = next_cycle_time - now
+    if USE_SMART_SCHEDULER and smart_scheduler:
+        # Smart scheduler timing
+        if not smart_scheduler.is_running():
+            await ctx.send("❌ Smart Scheduler is not running")
+            return
         
-        if time_until_next.total_seconds() <= 0:
-            time_until_next = timedelta(seconds=CHECK_INTERVAL)
-            next_cycle_time = now + time_until_next
-        
-        minutes, seconds = divmod(int(time_until_next.total_seconds()), 60)
-        hours, minutes = divmod(minutes, 60)
+        status_info = smart_scheduler.get_status_info()
         
         embed = discord.Embed(
-            title="⏰ Signal Check Timer",
+            title="🎯 Smart Scheduler Timer",
             color=0x00ff88,
             timestamp=datetime.now(EST)
         )
         
-        if hours > 0:
-            time_str = f"{hours}h {minutes}m {seconds}s"
-        elif minutes > 0:
-            time_str = f"{minutes}m {seconds}s"
-        else:
-            time_str = f"{seconds}s"
+        embed.add_field(
+            name="⏳ Next Check",
+            value=f"`{status_info['time_until_next']}`",
+            inline=True
+        )
         
-        embed.add_field(name="⏳ Time Until Next Check", value=f"`{time_str}`", inline=True)
-        embed.add_field(name="🕐 Next Check At (EST)", value=f"`{next_cycle_time.strftime('%I:%M:%S %p')}`", inline=True)
-        embed.add_field(name="🔄 Check Interval", value=f"`{CHECK_INTERVAL} seconds`", inline=True)
+        embed.add_field(
+            name="🕐 Next Check Time (EST)",
+            value=f"`{status_info['next_run_time']}`",
+            inline=True
+        )
         
-        # Progress bar
-        progress = 1 - (time_until_next.total_seconds() / CHECK_INTERVAL)
-        bar_length = 20
-        filled = int(progress * bar_length)
-        bar = "█" * filled + "░" * (bar_length - filled)
-        embed.add_field(name="📊 Progress", value=f"`{bar}` {progress*100:.1f}%", inline=False)
+        embed.add_field(
+            name="📋 Check Reason",
+            value=f"`{status_info['next_run_reason']}`",
+            inline=True
+        )
         
-        embed.set_footer(text="💡 Use !status for full bot information")
+        embed.add_field(
+            name="📈 Market Hours",
+            value=f"`{'Yes' if status_info['is_market_hours'] else 'No'}`",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🎯 Scheduler Type",
+            value="`Smart Scheduler`",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🔄 Checks Completed",
+            value=f"`{checks_completed}`",
+            inline=True
+        )
+        
+        # Show upcoming runs
+        if status_info['upcoming_runs']:
+            upcoming_text = ""
+            for i, run in enumerate(status_info['upcoming_runs'][:3], 1):
+                priority_icon = "⭐" if run['is_priority'] else "📊"
+                market_icon = "📈" if run['is_market_hours'] else "🌙"
+                upcoming_text += f"{i}. {run['time']} {priority_icon} {market_icon}\n"
+            
+            embed.add_field(
+                name="📅 Upcoming Checks",
+                value=upcoming_text,
+                inline=False
+            )
+        
+        embed.set_footer(text="⭐ Priority runs align with hourly candle closes • 📈 Market hours • 🌙 After hours")
         
     else:
-        embed = discord.Embed(
-            title="⏰ Signal Check Timer",
-            description="Timer information not available yet",
-            color=0xff0000
-        )
+        # Legacy scheduler timing
+        if not signal_check_loop.is_running():
+            await ctx.send("❌ Signal monitoring is not running")
+            return
+
+        now = datetime.now(EST)
+        
+        if loop_start_time:
+            elapsed = (now - loop_start_time).total_seconds()
+            cycles_completed = int(elapsed // CHECK_INTERVAL)
+            next_cycle_time = loop_start_time + timedelta(seconds=(cycles_completed + 1) * CHECK_INTERVAL)
+            time_until_next = next_cycle_time - now
+            
+            if time_until_next.total_seconds() <= 0:
+                time_until_next = timedelta(seconds=CHECK_INTERVAL)
+                next_cycle_time = now + time_until_next
+            
+            minutes, seconds = divmod(int(time_until_next.total_seconds()), 60)
+            hours, minutes = divmod(minutes, 60)
+            
+            embed = discord.Embed(
+                title="⏰ Legacy Scheduler Timer",
+                color=0x00ff88,
+                timestamp=datetime.now(EST)
+            )
+            
+            if hours > 0:
+                time_str = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                time_str = f"{minutes}m {seconds}s"
+            else:
+                time_str = f"{seconds}s"
+            
+            embed.add_field(name="⏳ Time Until Next Check", value=f"`{time_str}`", inline=True)
+            embed.add_field(name="🕐 Next Check At (EST)", value=f"`{next_cycle_time.strftime('%I:%M:%S %p')}`", inline=True)
+            embed.add_field(name="🔄 Check Interval", value=f"`{CHECK_INTERVAL} seconds`", inline=True)
+            
+            # Progress bar
+            progress = 1 - (time_until_next.total_seconds() / CHECK_INTERVAL)
+            bar_length = 20
+            filled = int(progress * bar_length)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            embed.add_field(name="📊 Progress", value=f"`{bar}`", inline=False)
+        else:
+            embed = discord.Embed(title="⏰ Timer", description="⚠️ No timing information available", color=0xff0000)
     
     await ctx.send(embed=embed)
+
+@bot.command(name='schedule')
+async def show_schedule(ctx):
+    """Show smart scheduler configuration and upcoming runs"""
+    if not USE_SMART_SCHEDULER or not smart_scheduler:
+        await ctx.send("❌ Smart Scheduler is not enabled. Set `USE_SMART_SCHEDULER=true` in .env to enable.")
+        return
+    
+    status_info = smart_scheduler.get_status_info()
+    
+    embed = discord.Embed(
+        title="🎯 Smart Scheduler Configuration",
+        description="Signal checks aligned with market candle closes",
+        color=0x0099ff,
+        timestamp=datetime.now(EST)
+    )
+    
+    # Current status
+    embed.add_field(
+        name="📊 Current Status",
+        value=f"""
+**Running:** {'✅ Yes' if status_info['running'] else '❌ No'}
+**Current Time:** {status_info['current_time']}
+**Market Hours:** {'📈 Yes' if status_info['is_market_hours'] else '🌙 No'}
+        """,
+        inline=False
+    )
+    
+    # Schedule configuration
+    embed.add_field(
+        name="⏰ Schedule Configuration",
+        value=f"""
+**Market Hours:** {smart_scheduler.run_at_minutes} minutes past each hour
+**After Hours:** {smart_scheduler.priority_run_minutes} minutes past each hour
+**Market Open:** 9:30 AM EST
+**Market Close:** 4:00 PM EST
+        """,
+        inline=False
+    )
+    
+    # Next runs
+    if status_info['upcoming_runs']:
+        upcoming_text = ""
+        for i, run in enumerate(status_info['upcoming_runs'], 1):
+            priority_icon = "⭐" if run['is_priority'] else "📊"
+            market_icon = "📈" if run['is_market_hours'] else "🌙"
+            upcoming_text += f"{i}. **{run['time']}** {priority_icon} {market_icon}\n   _{run['reason']}_\n"
+        
+        embed.add_field(
+            name="📅 Next 3 Scheduled Runs",
+            value=upcoming_text,
+            inline=False
+        )
+    
+    embed.set_footer(text="⭐ Priority runs (hourly candles) • 📊 Regular runs • 📈 Market hours • 🌙 After hours")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='scheduler')
+async def scheduler_control(ctx, action: str = None):
+    """Control the smart scheduler
+    
+    Usage:
+    !scheduler - Show scheduler status
+    !scheduler start - Start the smart scheduler
+    !scheduler stop - Stop the smart scheduler
+    !scheduler restart - Restart the smart scheduler
+    !scheduler switch - Switch between smart and legacy scheduler
+    """
+    global smart_scheduler, USE_SMART_SCHEDULER
+    
+    if action is None:
+        # Show status
+        embed = discord.Embed(
+            title="🎛️ Scheduler Control",
+            color=0x0099ff,
+            timestamp=datetime.now(EST)
+        )
+        
+        scheduler_type = "Smart Scheduler" if USE_SMART_SCHEDULER else "Legacy Scheduler"
+        running_status = "❌ Not Running"
+        
+        if USE_SMART_SCHEDULER and smart_scheduler:
+            running_status = "✅ Running" if smart_scheduler.is_running() else "❌ Stopped"
+        elif not USE_SMART_SCHEDULER and signal_check_loop.is_running():
+            running_status = "✅ Running"
+        
+        embed.add_field(
+            name="📊 Current Configuration",
+            value=f"""
+**Type:** {scheduler_type}
+**Status:** {running_status}
+**Checks Completed:** {checks_completed}
+            """,
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🎮 Available Commands",
+            value="""
+`!scheduler start` - Start scheduler
+`!scheduler stop` - Stop scheduler  
+`!scheduler restart` - Restart scheduler
+`!scheduler switch` - Switch scheduler type
+            """,
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    action = action.lower()
+    
+    if action == "start":
+        if USE_SMART_SCHEDULER:
+            if smart_scheduler and smart_scheduler.is_running():
+                await ctx.send("⚠️ Smart Scheduler is already running")
+            else:
+                if not smart_scheduler:
+                    smart_scheduler = create_smart_scheduler(smart_signal_check)
+                smart_scheduler.start()
+                await ctx.send("✅ Smart Scheduler started")
+        else:
+            if signal_check_loop.is_running():
+                await ctx.send("⚠️ Legacy scheduler is already running")
+            else:
+                signal_check_loop.start()
+                await ctx.send("✅ Legacy scheduler started")
+    
+    elif action == "stop":
+        if USE_SMART_SCHEDULER and smart_scheduler:
+            smart_scheduler.stop()
+            await ctx.send("⏹️ Smart Scheduler stopped")
+        elif not USE_SMART_SCHEDULER:
+            signal_check_loop.stop()
+            await ctx.send("⏹️ Legacy scheduler stopped")
+        else:
+            await ctx.send("❌ No scheduler to stop")
+    
+    elif action == "restart":
+        if USE_SMART_SCHEDULER and smart_scheduler:
+            smart_scheduler.stop()
+            await asyncio.sleep(2)
+            smart_scheduler.start()
+            await ctx.send("🔄 Smart Scheduler restarted")
+        elif not USE_SMART_SCHEDULER:
+            signal_check_loop.restart()
+            await ctx.send("🔄 Legacy scheduler restarted")
+        else:
+            await ctx.send("❌ No scheduler to restart")
+    
+    elif action == "switch":
+        await ctx.send("🔧 Scheduler switching requires bot restart. Update `USE_SMART_SCHEDULER` in .env and restart the bot.")
+    
+    else:
+        await ctx.send(f"❌ Unknown action '{action}'. Use: start, stop, restart, or switch")
 
 @bot.command(name='status')
 async def bot_status(ctx):
@@ -1592,93 +1757,91 @@ async def show_config(ctx):
 
 @bot.command(name='notifications')
 async def notification_stats(ctx):
-    """Show notification statistics and cleanup status"""
-    notifier = SignalNotifier(bot)
-    
-    # Get current stats
-    total_entries = len(notifier.last_notifications)
-    current_time = datetime.now()
-    
-    # Analyze entry ages
-    recent_entries = 0
-    old_entries = 0
-    malformed_entries = 0
-    
-    for key, timestamp_str in notifier.last_notifications.items():
-        try:
-            if 'T' in timestamp_str:
-                timestamp = datetime.fromisoformat(timestamp_str)
-            else:
-                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d')
-            
-            age_days = (current_time - timestamp).days
-            if age_days < 1:
-                recent_entries += 1
-            elif age_days >= 7:
-                old_entries += 1
-        except (ValueError, TypeError):
-            malformed_entries += 1
-    
-    embed = discord.Embed(
-        title="📊 Notification Statistics",
-        color=0x00ff88,
-        timestamp=datetime.now(EST)
-    )
-    
-    embed.add_field(name="📝 Total Entries", value=f"`{total_entries}`", inline=True)
-    embed.add_field(name="🆕 Recent (< 1 day)", value=f"`{recent_entries}`", inline=True)
-    embed.add_field(name="🗑️ Old (≥ 7 days)", value=f"`{old_entries}`", inline=True)
-    embed.add_field(name="❌ Malformed", value=f"`{malformed_entries}`", inline=True)
-    embed.add_field(name="📁 File Size", value=f"`{os.path.getsize(LAST_NOTIFICATION_FILE) if os.path.exists(LAST_NOTIFICATION_FILE) else 0} bytes`", inline=True)
-    
-    # Show cleanup recommendation
-    if old_entries > 0 or malformed_entries > 0:
-        embed.add_field(
-            name="💡 Recommendation", 
-            value=f"Run `!cleanup` to remove {old_entries + malformed_entries} old/malformed entries", 
-            inline=False
+    """Show notification statistics from database"""
+    try:
+        # Get database statistics
+        stats = await get_stats()
+        
+        embed = discord.Embed(
+            title="📊 Notification Statistics",
+            color=0x0099ff,
+            timestamp=datetime.now(EST)
         )
-    else:
-        embed.add_field(name="✅ Status", value="Notification storage is clean", inline=False)
-    
-    embed.set_footer(text="💡 Automatic cleanup runs every 10 signal check cycles")
-    
-    await ctx.send(embed=embed)
+        
+        embed.add_field(
+            name="📨 Total Notifications", 
+            value=f"`{stats.get('total_notifications', 0)}`", 
+            inline=True
+        )
+        embed.add_field(
+            name="🆕 Last 24 Hours", 
+            value=f"`{stats.get('last_24h', 0)}`", 
+            inline=True
+        )
+        
+        most_active = stats.get('most_active_ticker')
+        if most_active:
+            embed.add_field(
+                name="📈 Most Active Ticker", 
+                value=f"`{most_active['ticker']}` ({most_active['count']} signals)", 
+                inline=True
+            )
+        
+        most_common = stats.get('most_common_signal')
+        if most_common:
+            embed.add_field(
+                name="🔔 Most Common Signal", 
+                value=f"`{most_common['signal_type'][:30]}...` ({most_common['count']})", 
+                inline=True
+            )
+        
+        embed.add_field(
+            name="💾 Storage", 
+            value="PostgreSQL Database", 
+            inline=True
+        )
+        embed.add_field(
+            name="🔧 Duplicate Prevention", 
+            value="Database Constraints", 
+            inline=True
+        )
+        
+        embed.set_footer(text="💡 Database auto-cleans entries older than 30 days")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting notification stats: {e}")
 
 @bot.command(name='cleanup')
 async def manual_cleanup(ctx):
-    """Manually trigger cleanup of old notification entries"""
-    notifier = SignalNotifier(bot)
-    
-    # Get stats before cleanup
-    before_count = len(notifier.last_notifications)
-    
-    # Perform cleanup
-    cleaned_count = notifier.cleanup_old_notifications()
-    
-    # Get stats after cleanup
-    after_count = len(notifier.last_notifications)
-    
-    embed = discord.Embed(
-        title="🧹 Notification Cleanup Complete",
-        color=0x00ff00,
-        timestamp=datetime.now(EST)
-    )
-    
-    embed.add_field(name="📊 Before", value=f"`{before_count} entries`", inline=True)
-    embed.add_field(name="📊 After", value=f"`{after_count} entries`", inline=True)
-    embed.add_field(name="🗑️ Removed", value=f"`{cleaned_count} entries`", inline=True)
-    
-    if cleaned_count > 0:
-        embed.add_field(
-            name="✅ Result", 
-            value=f"Successfully cleaned up {cleaned_count} old notification entries", 
-            inline=False
+    """Manually trigger cleanup of old notification entries from database"""
+    try:
+        # Perform database cleanup
+        cleaned_count = await cleanup_old(days=30)
+        
+        embed = discord.Embed(
+            title="🧹 Database Cleanup Complete",
+            color=0x00ff00,
+            timestamp=datetime.now(EST)
         )
-    else:
-        embed.add_field(name="ℹ️ Result", value="No old entries found to clean up", inline=False)
-    
-    await ctx.send(embed=embed)
+        
+        embed.add_field(name="🗑️ Removed", value=f"`{cleaned_count} entries`", inline=True)
+        embed.add_field(name="📅 Older Than", value="`30 days`", inline=True)
+        
+        if cleaned_count > 0:
+            embed.add_field(
+                name="✅ Result", 
+                value=f"Successfully cleaned up {cleaned_count} old notification entries from database", 
+                inline=False
+            )
+        else:
+            embed.add_field(name="ℹ️ Result", value="No old entries found to clean up", inline=False)
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error during cleanup: {e}")
 
 @bot.command(name='clear')
 async def clear_channel(ctx, limit = None):
@@ -2356,6 +2519,695 @@ async def uptime_command(ctx):
         
     except Exception as e:
         await ctx.send(f"❌ Error showing uptime: {str(e)}")
+
+@bot.command(name='priority')
+async def priority_settings(ctx, action: str = None, value: str = None):
+    """Manage priority settings for signal notifications
+    
+    Usage:
+    !priority - Show current priority settings
+    !priority level <CRITICAL|HIGH|MEDIUM|LOW|MINIMAL> - Set minimum priority level
+    !priority vip add <TICKER> - Add ticker to VIP list
+    !priority vip remove <TICKER> - Remove ticker from VIP list
+    !priority test <TICKER> - Test priority scoring for a ticker
+    """
+    from priority_manager import priority_manager
+    
+    embed = discord.Embed(
+        title="🎯 Priority Management",
+        color=0x0099ff,
+        timestamp=datetime.now(EST)
+    )
+    
+    if action is None:
+        # Show current settings
+        embed.add_field(
+            name="Current Settings",
+            value=f"""
+**Minimum Priority Level:** {priority_manager.MIN_PRIORITY_LEVEL}
+**Critical Threshold:** {priority_manager.CRITICAL_THRESHOLD}
+**High Threshold:** {priority_manager.HIGH_THRESHOLD}
+**Medium Threshold:** {priority_manager.MEDIUM_THRESHOLD}
+**Low Threshold:** {priority_manager.LOW_THRESHOLD}
+            """,
+            inline=False
+        )
+        
+        embed.add_field(
+            name="VIP Tickers",
+            value=", ".join(sorted(priority_manager.VIP_TICKERS)) or "None",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="VIP Timeframes", 
+            value=", ".join(sorted(priority_manager.VIP_TIMEFRAMES)) or "None",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Available Commands",
+            value="""
+`!priority level <LEVEL>` - Set minimum priority
+`!priority vip add <TICKER>` - Add VIP ticker
+`!priority vip remove <TICKER>` - Remove VIP ticker
+`!priority test <TICKER>` - Test priority scoring
+            """,
+            inline=False
+        )
+        
+    elif action == "level" and value:
+        valid_levels = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'MINIMAL']
+        if value.upper() in valid_levels:
+            priority_manager.MIN_PRIORITY_LEVEL = value.upper()
+            embed.add_field(
+                name="✅ Priority Level Updated",
+                value=f"Minimum priority level set to: **{value.upper()}**",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="❌ Invalid Priority Level",
+                value=f"Valid levels: {', '.join(valid_levels)}",
+                inline=False
+            )
+    
+    elif action == "vip" and value:
+        parts = value.split()
+        if len(parts) >= 2:
+            sub_action = parts[0].lower()
+            ticker = parts[1].upper()
+            
+            if sub_action == "add":
+                priority_manager.VIP_TICKERS.add(ticker)
+                embed.add_field(
+                    name="✅ VIP Ticker Added",
+                    value=f"Added **{ticker}** to VIP tickers list",
+                    inline=False
+                )
+            elif sub_action == "remove":
+                priority_manager.VIP_TICKERS.discard(ticker)
+                embed.add_field(
+                    name="✅ VIP Ticker Removed", 
+                    value=f"Removed **{ticker}** from VIP tickers list",
+                    inline=False
+                )
+    
+    elif action == "test" and value:
+        ticker = value.upper()
+        # Create a sample signal for testing
+        test_signal = {
+            'type': 'WT Buy Signal',
+            'strength': 'Strong',
+            'system': 'Wave Trend',
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        priority_score = calculate_signal_priority(test_signal, ticker, '1d')
+        
+        embed.add_field(
+            name=f"🧪 Priority Test: {ticker}",
+            value=priority_manager.get_debug_breakdown(priority_score),
+            inline=False
+        )
+    
+    else:
+        embed.add_field(
+            name="❌ Invalid Command",
+            value="Use `!priority` to see available commands",
+            inline=False
+        )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='prioritystats')
+async def priority_statistics(ctx):
+    """Show priority statistics for recent signals"""
+    from priority_manager import priority_manager
+    
+    try:
+        # Get recent notifications from database
+        recent_notifications = await get_stats()
+        
+        embed = discord.Embed(
+            title="📊 Priority Statistics",
+            color=0x0099ff,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Show priority distribution if we have notifications
+        if recent_notifications and recent_notifications.get('total_notifications', 0) > 0:
+            embed.add_field(
+                name="Recent Activity",
+                value=f"""
+**Total Notifications:** {recent_notifications.get('total_notifications', 0)}
+**Total Detected:** {recent_notifications.get('total_detected', 0)}
+**Last 24 Hours:** {recent_notifications.get('last_24h', 0)}
+**Last 7 Days:** {recent_notifications.get('last_7d', 0)}
+**Utilization Rate:** {recent_notifications.get('utilization_rate_24h', 0)}%
+                """,
+                inline=False
+            )
+            
+            # Priority distribution
+            priority_dist = recent_notifications.get('priority_distribution', {})
+            if priority_dist:
+                embed.add_field(
+                    name="Priority Distribution (24h)",
+                    value=f"""
+🚨 **Critical:** {priority_dist.get('critical', 0)}
+⚠️ **High:** {priority_dist.get('high', 0)}
+📊 **Medium:** {priority_dist.get('medium', 0)}
+📢 **Low:** {priority_dist.get('low', 0)}
+📝 **Minimal:** {priority_dist.get('minimal', 0)}
+                    """,
+                    inline=True
+                )
+        
+        embed.add_field(
+            name="Priority Thresholds",
+            value=f"""
+🚨 **Critical:** {priority_manager.CRITICAL_THRESHOLD}+ points
+⚠️ **High:** {priority_manager.HIGH_THRESHOLD}+ points  
+📊 **Medium:** {priority_manager.MEDIUM_THRESHOLD}+ points
+📢 **Low:** {priority_manager.LOW_THRESHOLD}+ points
+📝 **Minimal:** Below {priority_manager.LOW_THRESHOLD} points
+            """,
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Scoring System",
+            value="""
+**Base Score:** 10 points
+**Strength Bonus:** Up to 25 points
+**System Bonus:** Up to 20 points
+**VIP Ticker Bonus:** 15 points
+**VIP Timeframe Bonus:** 10 points
+**Urgency Bonus:** Up to 20 points
+**Pattern Bonus:** Up to 30 points
+            """,
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting priority statistics: {e}")
+
+@bot.command(name='analytics')
+async def signal_analytics(ctx, days: int = 7):
+    """Show comprehensive signal analytics
+    
+    Usage:
+    !analytics - Show 7-day analytics
+    !analytics 3 - Show 3-day analytics
+    !analytics 14 - Show 14-day analytics
+    """
+    try:
+        if days < 1 or days > 30:
+            await ctx.send("❌ Days must be between 1 and 30")
+            return
+            
+        analytics = await get_priority_analytics(days)
+        
+        if not analytics:
+            await ctx.send("❌ No analytics data available")
+            return
+            
+        embed = discord.Embed(
+            title=f"📈 Signal Analytics ({days} days)",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Detection overview
+        detection_stats = analytics.get('detection_stats', {})
+        if detection_stats:
+            total_detected = detection_stats.get('total_detected', 0)
+            total_sent = detection_stats.get('total_sent', 0)
+            total_skipped = detection_stats.get('total_skipped', 0)
+            avg_priority = detection_stats.get('avg_priority_score', 0)
+            
+            embed.add_field(
+                name="🔍 Detection Overview",
+                value=f"""
+**Total Detected:** {total_detected}
+**Notifications Sent:** {total_sent}
+**Signals Skipped:** {total_skipped}
+**Utilization Rate:** {(total_sent/max(total_detected,1)*100):.1f}%
+**Avg Priority Score:** {avg_priority:.1f}
+                """,
+                inline=False
+            )
+            
+            # Priority breakdown
+            embed.add_field(
+                name="🏆 Priority Breakdown",
+                value=f"""
+🚨 **Critical:** {detection_stats.get('critical_count', 0)}
+⚠️ **High:** {detection_stats.get('high_count', 0)}
+📊 **Medium:** {detection_stats.get('medium_count', 0)}
+📢 **Low:** {detection_stats.get('low_count', 0)}
+📝 **Minimal:** {detection_stats.get('minimal_count', 0)}
+                """,
+                inline=True
+            )
+        
+        # Top systems
+        system_stats = analytics.get('system_stats', [])
+        if system_stats:
+            top_systems = system_stats[:5]
+            systems_text = ""
+            for system in top_systems:
+                sent_rate = (system['sent_signals'] / max(system['total_signals'], 1)) * 100
+                systems_text += f"**{system['system']}:** {system['total_signals']} detected, {system['sent_signals']} sent ({sent_rate:.1f}%)\n"
+            
+            embed.add_field(
+                name="🏗️ Top Systems",
+                value=systems_text[:1000],
+                inline=False
+            )
+        
+        # Top skipped signals (missed opportunities)
+        top_skipped = analytics.get('top_skipped', [])
+        if top_skipped:
+            skipped_text = ""
+            for signal in top_skipped[:5]:
+                skipped_text += f"**{signal['ticker']} {signal['signal_type']}:** Score {signal['priority_score']} ({signal['count']}x)\n"
+            
+            embed.add_field(
+                name="⚠️ Top Missed Opportunities",
+                value=skipped_text[:1000],
+                inline=False
+            )
+        
+        embed.set_footer(text="💡 Use !utilization for detailed signal usage analysis")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting analytics: {e}")
+
+@bot.command(name='utilization')
+async def signal_utilization(ctx):
+    """Show detailed signal utilization analysis (last 24 hours)"""
+    try:
+        utilization = await get_signal_utilization()
+        
+        if not utilization:
+            await ctx.send("❌ No utilization data available")
+            return
+            
+        embed = discord.Embed(
+            title="🔬 Signal Utilization Analysis (24h)",
+            description="Comprehensive breakdown of signal detection and usage",
+            color=0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Signal type utilization
+        signal_types = utilization.get('signal_type_stats', [])
+        if signal_types:
+            top_signals = signal_types[:8]
+            signal_text = ""
+            for signal in top_signals:
+                utilization_rate = (signal['sent'] / max(signal['detected'], 1)) * 100
+                signal_text += f"**{signal['signal_type'][:20]}:** {signal['detected']} detected, {signal['sent']} sent ({utilization_rate:.1f}%)\n"
+            
+            embed.add_field(
+                name="📊 Signal Type Utilization",
+                value=signal_text[:1000],
+                inline=False
+            )
+        
+        # Timeframe utilization  
+        timeframes = utilization.get('timeframe_stats', [])
+        if timeframes:
+            timeframe_text = ""
+            for tf in timeframes:
+                utilization_rate = (tf['sent'] / max(tf['detected'], 1)) * 100
+                timeframe_text += f"**{tf['timeframe']}:** {tf['detected']} detected, {tf['sent']} sent ({utilization_rate:.1f}%)\n"
+            
+            embed.add_field(
+                name="⏱️ Timeframe Performance",
+                value=timeframe_text,
+                inline=True
+            )
+        
+        # System utilization
+        systems = utilization.get('system_utilization', [])
+        if systems:
+            system_text = ""
+            for system in systems[:6]:
+                utilization_rate = (system['sent'] / max(system['detected'], 1)) * 100
+                system_text += f"**{system['system']}:** {system['detected']} detected, {system['sent']} sent ({utilization_rate:.1f}%)\n"
+            
+            embed.add_field(
+                name="🏗️ System Utilization",
+                value=system_text[:1000],
+                inline=True
+            )
+        
+        # Missed opportunities
+        missed = utilization.get('missed_opportunities', [])
+        if missed:
+            missed_text = ""
+            for opp in missed[:5]:
+                missed_text += f"**{opp['ticker']} {opp['signal_type'][:15]}:** Score {opp['priority_score']} - {opp['skip_reason']}\n"
+            
+            embed.add_field(
+                name="💔 High-Priority Missed Opportunities",
+                value=missed_text[:1000],
+                inline=False
+            )
+        
+        embed.set_footer(text="💡 Use !analytics for historical trends • !missed for recent missed signals")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting utilization report: {e}")
+
+@bot.command(name='missed')
+async def missed_opportunities(ctx, hours: int = 24):
+    """Show high-priority signals that were skipped recently
+    
+    Usage:
+    !missed - Show missed signals from last 24 hours
+    !missed 6 - Show missed signals from last 6 hours
+    !missed 48 - Show missed signals from last 48 hours
+    """
+    try:
+        if hours < 1 or hours > 168:  # Max 1 week
+            await ctx.send("❌ Hours must be between 1 and 168 (1 week)")
+            return
+            
+        # Get utilization data which includes missed opportunities
+        utilization = await get_signal_utilization()
+        missed = utilization.get('missed_opportunities', [])
+        
+        if not missed:
+            await ctx.send(f"✅ No high-priority signals were skipped in the last {hours} hours!")
+            return
+            
+        embed = discord.Embed(
+            title=f"💔 Missed High-Priority Signals ({len(missed)} found)",
+            description=f"Signals with priority score ≥60 that were skipped in the last {hours} hours",
+            color=0xff3333,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Group by skip reason
+        skip_reasons = {}
+        for signal in missed:
+            reason = signal.get('skip_reason', 'unknown')
+            if reason not in skip_reasons:
+                skip_reasons[reason] = []
+            skip_reasons[reason].append(signal)
+        
+        # Show breakdown by reason
+        for reason, signals in skip_reasons.items():
+            if len(signals) > 5:
+                reason_text = f"**{len(signals)} signals skipped**\n"
+                for signal in signals[:3]:
+                    reason_text += f"• {signal['ticker']} {signal['signal_type'][:20]} (Score: {signal['priority_score']})\n"
+                reason_text += f"• ... and {len(signals)-3} more"
+            else:
+                reason_text = ""
+                for signal in signals:
+                    reason_text += f"• **{signal['ticker']}** {signal['signal_type'][:25]} (Score: {signal['priority_score']})\n"
+            
+            embed.add_field(
+                name=f"Reason: {reason.replace('_', ' ').title()}",
+                value=reason_text[:1000],
+                inline=False
+            )
+        
+        # Add suggestions
+        suggestions = ""
+        if any('priority_below_threshold' in reason for reason in skip_reasons.keys()):
+            suggestions += "• Consider lowering `MIN_PRIORITY_LEVEL` to capture more signals\n"
+        if 'duplicate_notification' in skip_reasons:
+            suggestions += "• Many duplicates found - this is normal and prevents spam\n"
+        
+        if suggestions:
+            embed.add_field(
+                name="💡 Suggestions",
+                value=suggestions,
+                inline=False
+            )
+        
+        embed.set_footer(text="💡 Use !priority level LOW to receive more signals • !analytics for trends")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error getting missed opportunities: {e}")
+
+@bot.command(name='signalreport')
+async def comprehensive_signal_report(ctx):
+    """Generate a comprehensive signal detection and utilization report"""
+    try:
+        # Send typing indicator for longer operation
+        async with ctx.typing():
+            # Get both analytics and utilization data
+            analytics = await get_priority_analytics(7)
+            utilization = await get_signal_utilization()
+            stats = await get_stats()
+            
+            embed = discord.Embed(
+                title="📋 Comprehensive Signal Report",
+                description="Complete analysis of signal detection, priority scoring, and utilization",
+                color=0x9932cc,
+                timestamp=datetime.now(EST)
+            )
+            
+            # Executive summary
+            if stats:
+                total_detected = stats.get('total_detected', 0)
+                total_sent = stats.get('total_notifications', 0)
+                utilization_rate = stats.get('utilization_rate_24h', 0)
+                
+                embed.add_field(
+                    name="📈 Executive Summary",
+                    value=f"""
+**Overall Performance:** {'✅ Excellent' if utilization_rate > 80 else '⚠️ Needs Attention' if utilization_rate > 50 else '❌ Poor'}
+**Detection Rate:** {total_detected} signals/day
+**Notification Rate:** {total_sent} alerts/day  
+**Utilization Efficiency:** {utilization_rate}%
+**Signal Coverage:** {'Comprehensive' if total_detected > 50 else 'Moderate' if total_detected > 20 else 'Limited'}
+                    """,
+                    inline=False
+                )
+            
+            # Key metrics
+            detection_stats = analytics.get('detection_stats', {}) if analytics else {}
+            if detection_stats:
+                avg_priority = detection_stats.get('avg_priority_score', 0)
+                total_detected_7d = detection_stats.get('total_detected', 0)
+                total_sent_7d = detection_stats.get('total_sent', 0)
+                
+                embed.add_field(
+                    name="🎯 Key Metrics (7 days)",
+                    value=f"""
+**Signals Detected:** {total_detected_7d}
+**Notifications Sent:** {total_sent_7d}
+**Average Priority:** {avg_priority:.1f}
+**Signal Quality:** {'High' if avg_priority > 60 else 'Medium' if avg_priority > 40 else 'Low'}
+                    """,
+                    inline=True
+                )
+            
+            # System performance
+            if analytics and analytics.get('system_stats'):
+                best_system = analytics['system_stats'][0]
+                embed.add_field(
+                    name="🏆 Top Performing System",
+                    value=f"""
+**System:** {best_system['system']}
+**Signals:** {best_system['total_signals']}
+**Sent:** {best_system['sent_signals']}
+**Avg Priority:** {best_system['avg_priority']:.1f}
+                    """,
+                    inline=True
+                )
+            
+            # Recommendations
+            recommendations = []
+            
+            if utilization_rate < 50:
+                recommendations.append("• Consider lowering priority thresholds to catch more signals")
+            if avg_priority < 40:
+                recommendations.append("• Review VIP ticker and timeframe settings")
+            if total_detected < 20:
+                recommendations.append("• Add more tickers or timeframes for better coverage")
+            if not recommendations:
+                recommendations.append("• System is performing well - continue monitoring")
+                
+            embed.add_field(
+                name="💡 Recommendations",
+                value="\n".join(recommendations),
+                inline=False
+            )
+            
+            embed.set_footer(text="💡 Use !analytics, !utilization, or !missed for detailed analysis")
+            
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error generating comprehensive report: {e}")
+
+async def smart_signal_check(cycle_count: int, is_priority: bool, reason: str):
+    """Enhanced signal check function for smart scheduler"""
+    global loop_start_time, checks_completed, last_successful_check, health_stats
+    
+    try:
+        cycle_start = datetime.now(EST)
+        loop_start_time = cycle_start
+        checks_completed = cycle_count
+        total_signals = 0
+        notified_signals = 0
+        
+        print(f"\n🎯 Smart Signal Check #{cycle_count}")
+        print(f"🕐 Check time: {cycle_start.strftime('%Y-%m-%d %I:%M:%S %p EST')}")
+        print(f"📋 Reason: {reason}")
+        print(f"⭐ Priority run: {'Yes' if is_priority else 'No'}")
+        
+        # Railway health logging
+        if os.getenv('RAILWAY_ENVIRONMENT'):
+            print(f"🚂 Railway check #{cycle_count} - Smart scheduler active")
+        
+        # Create notifier instance
+        notifier = SignalNotifier(bot)
+        
+        # Periodic cleanup of old notifications (every 10 cycles)
+        if cycle_count % 10 == 0:
+            cleaned_count = notifier.cleanup_old_notifications()
+            if cleaned_count > 0:
+                print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
+        
+        # Check each ticker across all timeframes
+        api_errors = 0
+        discord_errors = 0
+        
+        for ticker in TICKERS:
+            for timeframe in TIMEFRAMES:
+                try:
+                    print(f"\n📊 Checking {ticker} ({timeframe})...")
+                    
+                    # Get recent signals using comprehensive detection
+                    recent_signals = notifier.check_for_new_signals(ticker, timeframe)
+                    total_signals += len(recent_signals)
+                    
+                    if recent_signals:
+                        print(f"✅ Found {len(recent_signals)} recent signals for {ticker} ({timeframe})")
+                        
+                        # Filter signals that should trigger notifications
+                        notify_signals = []
+                        for signal in recent_signals:
+                            should_notify_result = await notifier.should_notify(signal, ticker, timeframe)
+                            if should_notify_result:
+                                notify_signals.append(signal)
+                        
+                        if notify_signals:
+                            print(f"🚨 {len(notify_signals)} signals meet notification criteria")
+                            notified_signals += len(notify_signals)
+                            
+                            # Send notifications for qualifying signals
+                            for signal in notify_signals:
+                                try:
+                                    await notifier.send_signal_notification(signal, ticker, timeframe)
+                                    await asyncio.sleep(1)  # Rate limiting
+                                    health_stats['total_notifications_sent'] += 1
+                                except Exception as e:
+                                    print(f"❌ Discord error sending notification: {e}")
+                                    discord_errors += 1
+                                    health_stats['discord_errors'] += 1
+                        else:
+                            print(f"🔕 No signals meet notification criteria for {ticker} ({timeframe})")
+                    else:
+                        print(f"ℹ️ No recent signals for {ticker} ({timeframe})")
+                    
+                    # Brief pause between tickers
+                    await asyncio.sleep(0.5)
+                    
+                except requests.exceptions.RequestException as e:
+                    print(f"❌ API error checking {ticker} ({timeframe}): {e}")
+                    api_errors += 1
+                    health_stats['api_errors'] += 1
+                    continue
+                except Exception as e:
+                    print(f"❌ Unexpected error checking {ticker} ({timeframe}): {e}")
+                    continue
+        
+        # Update health stats
+        health_stats['total_signals_found'] += total_signals
+        last_successful_check = cycle_start
+        
+        # Calculate cycle duration and update bot presence
+        cycle_end = datetime.now(EST)
+        cycle_duration = (cycle_end - cycle_start).total_seconds()
+        
+        # Get next run info from smart scheduler
+        if smart_scheduler:
+            next_run_info = smart_scheduler.get_time_until_next_run()
+            minutes = int(next_run_info.total_seconds() // 60)
+            seconds = int(next_run_info.total_seconds() % 60)
+            
+            if minutes > 0:
+                status_text = f"Next: {minutes}m {seconds}s"
+            else:
+                status_text = f"Next: {seconds}s"
+            
+            await bot.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=status_text
+                )
+            )
+        
+        # Enhanced summary logging
+        print(f"\n📋 Smart Check #{cycle_count} completed!")
+        print(f"⏱️ Duration: {cycle_duration:.1f} seconds")
+        print(f"📊 Total signals found: {total_signals}")
+        print(f"🚨 Notifications sent: {notified_signals}")
+        print(f"❌ API errors: {api_errors}")
+        print(f"❌ Discord errors: {discord_errors}")
+        
+        if smart_scheduler:
+            next_runs = smart_scheduler.get_next_run_times(1)
+            if next_runs:
+                next_run = next_runs[0]
+                print(f"⏰ Next check: {next_run.strftime('%I:%M:%S %p EST')} ({smart_scheduler.get_run_reason(next_run)})")
+        
+        # Railway-specific logging
+        if os.getenv('RAILWAY_ENVIRONMENT'):
+            uptime = cycle_end - bot_start_time if bot_start_time else timedelta(0)
+            print(f"🚂 Railway uptime: {uptime}")
+            print(f"🔧 Railway health: ✅ Smart scheduler running normally")
+                
+    except Exception as e:
+        print(f"❌ Critical error in smart signal check: {e}")
+        health_stats['failed_checks'] += 1
+        
+        # Try to notify about the error
+        try:
+            channel = bot.get_channel(CHANNEL_ID)
+            if channel:
+                embed = discord.Embed(
+                    title="⚠️ Smart Scheduler Alert",
+                    description=f"Smart signal check #{cycle_count} failed",
+                    color=0xff0000,
+                    timestamp=datetime.now(EST)
+                )
+                embed.add_field(name="Error", value=str(e)[:1000], inline=False)
+                embed.add_field(name="Cycle", value=f"#{cycle_count}", inline=True)
+                embed.add_field(name="Reason", value=reason, inline=True)
+                embed.add_field(name="Time", value=datetime.now(EST).strftime('%I:%M:%S %p EST'), inline=True)
+                await channel.send(embed=embed)
+        except:
+            pass  # Don't let notification errors crash the scheduler
 
 if __name__ == "__main__":
     import asyncio
