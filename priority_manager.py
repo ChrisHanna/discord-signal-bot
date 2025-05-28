@@ -47,8 +47,10 @@ class SignalPriorityManager:
         self.load_priority_config()
     
     def load_priority_config(self):
-        """Load priority configuration from environment variables"""
-        # Priority thresholds
+        """Load priority configuration from environment variables and database"""
+        print("🎯 Loading priority configuration...")
+        
+        # Load thresholds from environment
         self.CRITICAL_THRESHOLD = int(os.getenv('PRIORITY_CRITICAL_THRESHOLD', '90'))
         self.HIGH_THRESHOLD = int(os.getenv('PRIORITY_HIGH_THRESHOLD', '70'))
         self.MEDIUM_THRESHOLD = int(os.getenv('PRIORITY_MEDIUM_THRESHOLD', '50'))
@@ -57,11 +59,16 @@ class SignalPriorityManager:
         # Minimum priority level to send notifications
         self.MIN_PRIORITY_LEVEL = os.getenv('MIN_PRIORITY_LEVEL', 'MEDIUM')
         
-        # High-priority tickers (get bonus points)
-        self.VIP_TICKERS = set(os.getenv('VIP_TICKERS', 'SPY,QQQ,AAPL,TSLA,NVDA').split(','))
+        # Initialize VIP tickers from environment (will be updated from database later)
+        env_vip_tickers = os.getenv('VIP_TICKERS', 'SPY,QQQ,AAPL,TSLA,NVDA').split(',')
+        self.VIP_TICKERS = set(ticker.strip().upper() for ticker in env_vip_tickers if ticker.strip())
         
         # High-priority timeframes
-        self.VIP_TIMEFRAMES = set(os.getenv('VIP_TIMEFRAMES', '1d,4h').split(','))
+        env_vip_timeframes = os.getenv('VIP_TIMEFRAMES', '1d,4h').split(',')
+        self.VIP_TIMEFRAMES = set(tf.strip() for tf in env_vip_timeframes if tf.strip())
+        
+        print(f"   Environment VIP Tickers: {sorted(self.VIP_TICKERS)}")
+        print(f"   Environment VIP Timeframes: {sorted(self.VIP_TIMEFRAMES)}")
         
         # System priority weights
         self.SYSTEM_WEIGHTS = {
@@ -108,6 +115,37 @@ class SignalPriorityManager:
             'Cross': 8,
             'Reversal': 6
         }
+    
+    async def sync_with_database(self):
+        """Sync VIP tickers and settings with PostgreSQL database"""
+        try:
+            # Import here to avoid circular imports
+            from database import get_vip_tickers_from_database, save_vip_tickers_to_database
+            
+            # Get VIP tickers from database
+            db_vip_tickers = await get_vip_tickers_from_database()
+            
+            if db_vip_tickers:
+                # Update from database
+                self.VIP_TICKERS = set(ticker.strip().upper() for ticker in db_vip_tickers if ticker.strip())
+                print(f"✅ Loaded VIP tickers from database: {sorted(self.VIP_TICKERS)}")
+            else:
+                # Save current environment config to database
+                current_vip_list = list(self.VIP_TICKERS)
+                success = await save_vip_tickers_to_database(current_vip_list)
+                if success:
+                    print(f"💾 Saved environment VIP tickers to database: {sorted(self.VIP_TICKERS)}")
+                else:
+                    print(f"⚠️ Failed to save VIP tickers to database")
+                    
+        except Exception as e:
+            print(f"⚠️ Error syncing with database: {e}")
+            print(f"📋 Using environment VIP tickers: {sorted(self.VIP_TICKERS)}")
+
+    def update_vip_tickers(self, vip_tickers: set):
+        """Update VIP tickers in memory"""
+        self.VIP_TICKERS = vip_tickers
+        print(f"🔄 Updated VIP tickers: {sorted(self.VIP_TICKERS)}")
     
     def calculate_urgency(self, signal_date: str) -> SignalUrgency:
         """Calculate signal urgency based on timing"""

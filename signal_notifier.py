@@ -1046,6 +1046,11 @@ async def on_ready():
     db_success = await init_database()
     if db_success:
         print("✅ Database connection established successfully")
+        
+        # ✅ NEW: Sync VIP tickers with database
+        print("🎯 Syncing priority manager with database...")
+        await priority_manager.sync_with_database()
+        print("✅ Priority manager synchronized with database")
     else:
         print("❌ Failed to initialize database - notifications will not work properly")
     
@@ -2645,13 +2650,16 @@ async def priority_settings(ctx, action: str = None, value: str = None):
             if sub_action == "add":
                 priority_manager.VIP_TICKERS.add(ticker)
                 
-                # ✅ NEW: Save to PostgreSQL database
+                # ✅ FIXED: Save to PostgreSQL database
                 current_vip_tickers = list(priority_manager.VIP_TICKERS)
                 db_success = await save_vip_tickers_to_database(current_vip_tickers)
                 
+                # Also update the priority_manager in-memory set to ensure consistency
+                priority_manager.update_vip_tickers(priority_manager.VIP_TICKERS)
+                
                 embed.add_field(
                     name="✅ VIP Ticker Added",
-                    value=f"Added **{ticker}** to VIP tickers list",
+                    value=f"Added **{ticker}** to VIP tickers list\n**Current VIP Tickers:** {', '.join(sorted(priority_manager.VIP_TICKERS))}",
                     inline=False
                 )
                 
@@ -2671,13 +2679,13 @@ async def priority_settings(ctx, action: str = None, value: str = None):
             elif sub_action == "remove":
                 priority_manager.VIP_TICKERS.discard(ticker)
                 
-                # ✅ NEW: Save to PostgreSQL database
+                # ✅ FIXED: Save to PostgreSQL database
                 current_vip_tickers = list(priority_manager.VIP_TICKERS)
                 db_success = await save_vip_tickers_to_database(current_vip_tickers)
                 
                 embed.add_field(
                     name="✅ VIP Ticker Removed", 
-                    value=f"Removed **{ticker}** from VIP tickers list",
+                    value=f"Removed **{ticker}** from VIP tickers list\n**Current VIP Tickers:** {', '.join(sorted(priority_manager.VIP_TICKERS))}",
                     inline=False
                 )
                 
@@ -3758,6 +3766,69 @@ async def analytics_health_check(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error running analytics health check: {e}")
 
+@bot.command(name='vipsync')
+async def vip_sync_command(ctx):
+    """Manually sync VIP tickers with database"""
+    try:
+        embed = discord.Embed(
+            title="🔄 VIP Ticker Sync",
+            description="Synchronizing VIP tickers with PostgreSQL database",
+            color=0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Show current state
+        current_vip = sorted(priority_manager.VIP_TICKERS)
+        embed.add_field(
+            name="Before Sync",
+            value=f"**Memory VIP Tickers:** {', '.join(current_vip) if current_vip else 'None'}",
+            inline=False
+        )
+        
+        # Sync with database
+        await priority_manager.sync_with_database()
+        
+        # Show updated state
+        updated_vip = sorted(priority_manager.VIP_TICKERS)
+        embed.add_field(
+            name="After Sync",
+            value=f"**Updated VIP Tickers:** {', '.join(updated_vip) if updated_vip else 'None'}",
+            inline=False
+        )
+        
+        # Show changes
+        changes_made = set(current_vip) != set(updated_vip)
+        if changes_made:
+            added = set(updated_vip) - set(current_vip)
+            removed = set(current_vip) - set(updated_vip)
+            
+            changes_text = ""
+            if added:
+                changes_text += f"**Added:** {', '.join(sorted(added))}\n"
+            if removed:
+                changes_text += f"**Removed:** {', '.join(sorted(removed))}\n"
+                
+            embed.add_field(
+                name="🔄 Changes Made",
+                value=changes_text,
+                inline=False
+            )
+            embed.color = 0x00ff00
+        else:
+            embed.add_field(
+                name="✅ No Changes",
+                value="VIP tickers were already synchronized",
+                inline=False
+            )
+            embed.color = 0x00ff88
+        
+        embed.set_footer(text="💡 VIP tickers are automatically synced on bot startup")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error syncing VIP tickers: {e}")
+
 @bot.command(name='commands')
 async def help_command(ctx):
     """Show all available bot commands organized by category"""
@@ -3820,6 +3891,7 @@ async def help_command(ctx):
 `!priority vip remove TICKER` - Remove VIP ticker
 `!priority test TICKER` - Test priority scoring
 `!prioritystats` - Priority statistics
+`!vipsync` - Manually sync VIP tickers from database
         """,
         inline=False
     )
