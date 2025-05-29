@@ -22,6 +22,7 @@ import traceback
 import atexit
 from dateutil import parser
 import logging
+import asyncpg
 
 # Import database functionality
 from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization, add_ticker_to_database, remove_ticker_from_database, get_database_tickers, save_vip_tickers_to_database, get_vip_tickers_from_database, save_priority_settings_to_database, update_daily_analytics, get_best_performing_signals, get_signal_performance_summary, cleanup_old_analytics, record_signal_performance
@@ -344,10 +345,21 @@ class SignalNotifier:
     async def auto_update_signal_performance(self, ticker: str, timeframe: str, api_data: Dict):
         """Auto-update performance for previous signals using API pricing data"""
         try:
-            from database import db_manager, record_signal_performance
+            from database import record_signal_performance
+            import asyncpg
+            import os
             
-            # Get signals from last 7 days that need performance updates
-            async with db_manager.pool.acquire() as conn:
+            # Get DATABASE_URL for direct connection
+            DATABASE_URL = os.getenv('DATABASE_URL')
+            if not DATABASE_URL:
+                print(f"⚠️ No DATABASE_URL set for performance tracking")
+                return
+            
+            # Use direct connection instead of pool (which may not be initialized)
+            conn = await asyncpg.connect(DATABASE_URL)
+            
+            try:
+                # Get signals from last 7 days that need performance updates
                 pending_signals = await conn.fetch('''
                     SELECT sn.ticker, sn.timeframe, sn.signal_type, sn.signal_date, sn.notified_at
                     FROM signal_notifications sn
@@ -366,6 +378,7 @@ class SignalNotifier:
                 ''', ticker, timeframe)
                 
                 if not pending_signals:
+                    # print(f"✅ No pending performance updates for {ticker} {timeframe}")
                     return  # No pending signals to update
                 
                 print(f"🔄 Auto-updating performance for {len(pending_signals)} {ticker} signals...")
@@ -402,10 +415,15 @@ class SignalNotifier:
                             )
                             
                             print(f"✅ Updated performance for {signal_type} signal from {signal_datetime.strftime('%Y-%m-%d %H:%M')}")
+                        else:
+                            print(f"⚠️ Could not calculate performance for {signal_type} signal from {signal_datetime.strftime('%Y-%m-%d %H:%M')}")
                         
                     except Exception as e:
                         print(f"⚠️ Error updating performance for signal {signal['signal_type']}: {e}")
                         continue
+                        
+            finally:
+                await conn.close()
                 
         except Exception as e:
             print(f"❌ Error in auto_update_signal_performance: {e}")
