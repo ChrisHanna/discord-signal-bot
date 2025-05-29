@@ -322,6 +322,9 @@ class SignalNotifier:
                 data = response.json()
                 print(f"✅ Received data for {ticker} ({timeframe}) with {period} period")
                 
+                # 🆕 NEW: Auto-update performance for previous signals using API data
+                asyncio.create_task(self.auto_update_signal_performance(ticker, timeframe, data))
+                
                 # Process the data the same way your dashboard does
                 signals = self.create_signal_timeline_from_data(data, timeframe)
                 print(f"✅ Found {len(signals)} signals for {ticker} ({timeframe})")
@@ -337,6 +340,268 @@ class SignalNotifier:
             print(f"❌ Error parsing JSON response for {ticker} ({timeframe}): {e}")
         
         return None
+    
+    async def auto_update_signal_performance(self, ticker: str, timeframe: str, api_data: Dict):
+        """Auto-update performance for previous signals using API pricing data"""
+        try:
+            from database import db_manager, record_signal_performance
+            
+            # Get signals from last 7 days that need performance updates
+            async with db_manager.pool.acquire() as conn:
+                pending_signals = await conn.fetch('''
+                    SELECT sn.ticker, sn.timeframe, sn.signal_type, sn.signal_date, sn.notified_at
+                    FROM signal_notifications sn
+                    LEFT JOIN signal_performance sp ON (
+                        sn.ticker = sp.ticker AND 
+                        sn.timeframe = sp.timeframe AND 
+                        sn.signal_type = sp.signal_type AND 
+                        sn.signal_date = sp.signal_date
+                    )
+                    WHERE sn.ticker = $1 
+                      AND sn.timeframe = $2
+                      AND sn.notified_at >= NOW() - INTERVAL '7 days'
+                      AND sp.id IS NULL  -- No performance data yet
+                    ORDER BY sn.signal_date DESC
+                    LIMIT 5  -- Process max 5 signals per API call to avoid overload
+                ''', ticker, timeframe)
+                
+                if not pending_signals:
+                    return  # No pending signals to update
+                
+                print(f"🔄 Auto-updating performance for {len(pending_signals)} {ticker} signals...")
+                
+                # Extract pricing data from API response
+                pricing_data = self.extract_pricing_data_from_api(api_data)
+                
+                if not pricing_data:
+                    print(f"⚠️ No pricing data available in API response for {ticker}")
+                    return
+                
+                # Update performance for each pending signal
+                for signal in pending_signals:
+                    try:
+                        signal_datetime = signal['signal_date']
+                        signal_type = signal['signal_type']
+                        
+                        # Calculate performance using API pricing data
+                        performance = self.calculate_performance_from_pricing(
+                            signal_datetime, pricing_data, timeframe
+                        )
+                        
+                        if performance and performance.get('price_at_signal'):
+                            await record_signal_performance(
+                                ticker=ticker,
+                                timeframe=timeframe,
+                                signal_type=signal_type,
+                                signal_date=signal_datetime.strftime('%Y-%m-%d %H:%M:%S'),
+                                price_at_signal=performance['price_at_signal'],
+                                price_after_1h=performance.get('price_after_1h'),
+                                price_after_4h=performance.get('price_after_4h'),
+                                price_after_1d=performance.get('price_after_1d'),
+                                price_after_3d=performance.get('price_after_3d')
+                            )
+                            
+                            print(f"✅ Updated performance for {signal_type} signal from {signal_datetime.strftime('%Y-%m-%d %H:%M')}")
+                        
+                    except Exception as e:
+                        print(f"⚠️ Error updating performance for signal {signal['signal_type']}: {e}")
+                        continue
+                
+        except Exception as e:
+            print(f"❌ Error in auto_update_signal_performance: {e}")
+    
+    def extract_pricing_data_from_api(self, api_data: Dict) -> Optional[List[Dict]]:
+        """Extract OHLCV pricing data from API response"""
+        try:
+            # 🎯 PRIMARY: OHLC data (confirmed structure from API testing)
+            if 'ohlc' in api_data and isinstance(api_data['ohlc'], list):
+                ohlc_data = api_data['ohlc']
+                if len(ohlc_data) > 0 and isinstance(ohlc_data[0], dict):
+                    print(f"✅ Found OHLC data: {len(ohlc_data)} data points")
+                    return ohlc_data
+            
+            # 🎯 SECONDARY: Separate arrays (also confirmed in API response)
+            dates = api_data.get('dates', [])
+            close_prices = api_data.get('close', [])
+            open_prices = api_data.get('open', [])
+            high_prices = api_data.get('high', [])
+            low_prices = api_data.get('low', [])
+            volumes = api_data.get('volume', [])
+            
+            if dates and close_prices and len(dates) == len(close_prices):
+                print(f"✅ Found separate arrays: {len(dates)} data points")
+                # Reconstruct OHLC format from separate arrays
+                combined_data = []
+                for i in range(len(dates)):
+                    data_point = {
+                        'date': dates[i],
+                        'timestamp': dates[i],
+                        't': dates[i],
+                        'close': close_prices[i],
+                        'c': close_prices[i],
+                        'price': close_prices[i]  # Fallback price field
+                    }
+                    
+                    # Add OHLV if available
+                    if i < len(open_prices) and open_prices[i] is not None:
+                        data_point['open'] = open_prices[i]
+                        data_point['o'] = open_prices[i]
+                    if i < len(high_prices) and high_prices[i] is not None:
+                        data_point['high'] = high_prices[i]
+                        data_point['h'] = high_prices[i]
+                    if i < len(low_prices) and low_prices[i] is not None:
+                        data_point['low'] = low_prices[i]
+                        data_point['l'] = low_prices[i]
+                    if i < len(volumes) and volumes[i] is not None:
+                        data_point['volume'] = volumes[i]
+                        data_point['v'] = volumes[i]
+                    
+                    combined_data.append(data_point)
+                
+                return combined_data
+            
+            # 🎯 FALLBACK: Other potential structures
+            # Option 3: Direct price data in main response
+            if 'prices' in api_data:
+                return api_data['prices']
+            
+            # Option 4: Historical data section
+            if 'historical' in api_data:
+                return api_data['historical']
+            
+            # Option 5: Data array with timestamps and prices
+            if 'data' in api_data and isinstance(api_data['data'], list):
+                return api_data['data']
+            
+            # Option 6: Check if API data contains timestamp/price pairs
+            if isinstance(api_data, dict):
+                for key in ['chart_data', 'price_data', 'candles', 'bars']:
+                    if key in api_data:
+                        return api_data[key]
+            
+            print(f"⚠️ No pricing data found. API data keys: {list(api_data.keys())}")
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ Error extracting pricing data: {e}")
+            return None
+    
+    def calculate_performance_from_pricing(self, signal_datetime: datetime, pricing_data: List[Dict], timeframe: str) -> Optional[Dict]:
+        """Calculate signal performance using pricing data"""
+        try:
+            if not pricing_data:
+                return None
+            
+            # Find the price closest to signal time
+            signal_price = self.find_closest_price(signal_datetime, pricing_data)
+            if not signal_price:
+                return None
+            
+            # Calculate target times for performance measurement
+            target_1h = signal_datetime + timedelta(hours=1)
+            target_4h = signal_datetime + timedelta(hours=4)
+            target_1d = signal_datetime + timedelta(days=1)
+            target_3d = signal_datetime + timedelta(days=3)
+            
+            # Find prices at target times
+            performance = {
+                'price_at_signal': signal_price,
+                'price_after_1h': self.find_closest_price(target_1h, pricing_data),
+                'price_after_4h': self.find_closest_price(target_4h, pricing_data),
+                'price_after_1d': self.find_closest_price(target_1d, pricing_data),
+                'price_after_3d': self.find_closest_price(target_3d, pricing_data)
+            }
+            
+            return performance
+            
+        except Exception as e:
+            print(f"⚠️ Error calculating performance: {e}")
+            return None
+    
+    def find_closest_price(self, target_datetime: datetime, pricing_data: List[Dict]) -> Optional[float]:
+        """Find the price closest to target datetime"""
+        try:
+            if not pricing_data:
+                return None
+            
+            closest_price = None
+            closest_diff = float('inf')
+            
+            for data_point in pricing_data:
+                if not isinstance(data_point, dict):
+                    continue
+                    
+                # Handle different timestamp formats in API data
+                timestamp = None
+                price = None
+                
+                # 🎯 PRIMARY: OHLC format from API (confirmed structure)
+                if 't' in data_point and 'c' in data_point:
+                    timestamp = data_point['t']  # Date in format "2025-05-28"
+                    price = data_point['c']      # Close price
+                
+                # 🎯 SECONDARY: Alternative OHLC formats
+                elif 'date' in data_point and 'close' in data_point:
+                    timestamp = data_point['date']
+                    price = data_point['close']
+                elif 'timestamp' in data_point and 'price' in data_point:
+                    timestamp = data_point['timestamp']
+                    price = data_point['price']
+                elif 'time' in data_point and 'value' in data_point:
+                    timestamp = data_point['time']
+                    price = data_point['value']
+                elif 'datetime' in data_point and 'close' in data_point:
+                    timestamp = data_point['datetime']
+                    price = data_point['close']
+                
+                if timestamp and price is not None:
+                    try:
+                        # Parse timestamp from API format
+                        if isinstance(timestamp, str):
+                            if 'T' in timestamp:
+                                # ISO format: "2025-05-28T09:30:00Z"
+                                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            elif ' ' in timestamp:
+                                # Full datetime: "2025-05-28 09:30:00"
+                                dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                            else:
+                                # Date only: "2025-05-28" (common in API response)
+                                dt = datetime.strptime(timestamp, '%Y-%m-%d')
+                                # For daily data, assume market close time (4 PM EST)
+                                dt = dt.replace(hour=16, minute=0, second=0)
+                        elif isinstance(timestamp, (int, float)):
+                            # Unix timestamp
+                            dt = datetime.fromtimestamp(timestamp)
+                        else:
+                            continue
+                        
+                        # Calculate time difference
+                        diff = abs((target_datetime - dt).total_seconds())
+                        
+                        if diff < closest_diff:
+                            closest_diff = diff
+                            closest_price = float(price)
+                            
+                    except (ValueError, TypeError) as e:
+                        continue
+            
+            # 🎯 ENHANCED: More generous time tolerance for daily data
+            # Daily data: 24 hours tolerance (signals can be from any time of day)
+            # Hourly data: 2 hours tolerance (more precision needed)
+            max_tolerance = 86400  # 24 hours in seconds (for daily data)
+            
+            if closest_diff < max_tolerance and closest_price is not None:
+                hours_diff = closest_diff / 3600
+                print(f"🎯 Found price ${closest_price:.2f} within {hours_diff:.1f}h of target time")
+                return closest_price
+            else:
+                print(f"⚠️ No price found within tolerance. Closest was {closest_diff/3600:.1f}h away")
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ Error finding closest price: {e}")
+            return None
     
     def create_signal_timeline_from_data(self, data: Dict, timeframe: str) -> List[Dict]:
         """Create signal timeline using pre-calculated signals from API response"""
@@ -4002,6 +4267,7 @@ async def help_command(ctx):
 `!analyticshealth` - Analytics system health check
 `!successrates [DAYS]` - Signal success rate analysis
 `!testperformance [TICKER]` - Add sample performance data
+`!debugapi [TICKER] [TF]` - Debug API response structure
         """,
         inline=False
     )
@@ -4633,6 +4899,117 @@ async def show_success_rates(ctx, days: int = 30):
         
     except Exception as e:
         await ctx.send(f"❌ Error getting success rates: {e}")
+
+@bot.command(name='debugapi')
+async def debug_api_response(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
+    """Debug command to inspect API response structure for pricing data
+    
+    Usage:
+    !debugapi            - Debug AAPL 1d response
+    !debugapi TSLA 1h    - Debug TSLA 1h response
+    """
+    try:
+        async with ctx.typing():
+            notifier = SignalNotifier(bot)
+            
+            # Make API call
+            params = {
+                'ticker': ticker.upper(),
+                'interval': timeframe,
+                'period': '1mo'
+            }
+            response = requests.get(f"{API_BASE_URL}/api/analyzer-b", params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                embed = discord.Embed(
+                    title=f"🔍 API Response Debug: {ticker.upper()} ({timeframe})",
+                    description="Analyzing API response structure for pricing data",
+                    color=0x9932cc,
+                    timestamp=datetime.now(EST)
+                )
+                
+                # Show main keys
+                main_keys = list(data.keys()) if isinstance(data, dict) else []
+                embed.add_field(
+                    name="🗝️ Main Response Keys",
+                    value=f"```{', '.join(main_keys[:10])}{'...' if len(main_keys) > 10 else ''}```",
+                    inline=False
+                )
+                
+                # Look for potential pricing data
+                pricing_candidates = []
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if isinstance(value, list) and len(value) > 0:
+                            first_item = value[0]
+                            if isinstance(first_item, dict):
+                                item_keys = list(first_item.keys())
+                                # Check if it looks like pricing data
+                                price_indicators = ['price', 'close', 'open', 'high', 'low', 'volume', 'timestamp', 'date', 'time']
+                                if any(indicator in ' '.join(item_keys).lower() for indicator in price_indicators):
+                                    pricing_candidates.append({
+                                        'key': key,
+                                        'count': len(value),
+                                        'sample_keys': item_keys[:5]
+                                    })
+                
+                if pricing_candidates:
+                    candidates_text = ""
+                    for candidate in pricing_candidates[:3]:
+                        candidates_text += f"**{candidate['key']}**: {candidate['count']} items\n"
+                        candidates_text += f"  Sample keys: {', '.join(candidate['sample_keys'])}\n\n"
+                    
+                    embed.add_field(
+                        name="💰 Potential Pricing Data",
+                        value=candidates_text[:1000],
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="💰 Potential Pricing Data",
+                        value="No obvious pricing data arrays found",
+                        inline=False
+                    )
+                
+                # Show a sample of the first pricing candidate
+                if pricing_candidates:
+                    first_candidate = pricing_candidates[0]
+                    sample_data = data[first_candidate['key']][:2]  # First 2 items
+                    
+                    embed.add_field(
+                        name=f"📊 Sample from '{first_candidate['key']}'",
+                        value=f"```json\n{json.dumps(sample_data, indent=2)[:500]}...```",
+                        inline=False
+                    )
+                
+                # Auto-extraction test
+                extracted = notifier.extract_pricing_data_from_api(data)
+                if extracted:
+                    embed.add_field(
+                        name="🤖 Auto-Extraction Result",
+                        value=f"✅ Found {len(extracted)} data points\nFirst item keys: {list(extracted[0].keys()) if extracted else 'None'}",
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="🤖 Auto-Extraction Result",
+                        value="❌ No pricing data extracted with current logic",
+                        inline=False
+                    )
+                
+            else:
+                embed = discord.Embed(
+                    title="❌ API Debug Failed",
+                    description=f"API returned status {response.status_code}",
+                    color=0xff0000
+                )
+            
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error debugging API response: {e}")
 
 if __name__ == "__main__":
     import asyncio
