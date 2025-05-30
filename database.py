@@ -266,7 +266,7 @@ class DatabaseManager:
     
     async def check_duplicate_notification(self, ticker: str, timeframe: str, 
                                          signal_type: str, signal_date: str) -> bool:
-        """Check if we've already sent this notification"""
+        """Check if we've already sent this notification OR if the signal is too old"""
         try:
             async with self.pool.acquire() as conn:
                 # Parse signal date
@@ -274,6 +274,13 @@ class DatabaseManager:
                     parsed_date = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
                 else:
                     parsed_date = datetime.strptime(signal_date, '%Y-%m-%d')
+                
+                # 🛡️ SIMPLE FIX: Block signals older than 24 hours to prevent old signals
+                # when new timeframes are added
+                signal_age_hours = (datetime.now() - parsed_date).total_seconds() / 3600
+                if signal_age_hours > 24:
+                    self.logger.info(f"🚫 Blocking old signal: {ticker} {timeframe} {signal_type} from {signal_age_hours:.1f}h ago")
+                    return True  # Treat as duplicate to prevent sending
                 
                 # Check if notification exists
                 result = await conn.fetchval('''
