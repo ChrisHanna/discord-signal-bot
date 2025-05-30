@@ -24,7 +24,7 @@ class DatabasePriorityConfig:
         self.medium_threshold = 50
         self.low_threshold = 30
         self.vip_tickers = set(['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA'])
-        self.vip_timeframes = set(['1d', '4h'])
+        self.vip_timeframes = set(['1d', '1h'])
         
     async def load_from_database(self, config_name: str = 'default') -> bool:
         """Load priority configuration from PostgreSQL database"""
@@ -86,7 +86,7 @@ class DatabasePriorityConfig:
         self.vip_tickers = set(ticker.strip().upper() for ticker in env_vip_tickers if ticker.strip())
         
         # Load VIP timeframes from environment
-        env_vip_timeframes = os.getenv('VIP_TIMEFRAMES', '1d,4h').split(',')
+        env_vip_timeframes = os.getenv('VIP_TIMEFRAMES', '1d,1h').split(',')
         self.vip_timeframes = set(tf.strip() for tf in env_vip_timeframes if tf.strip())
         
         print(f"📊 Loaded from environment: {len(self.vip_tickers)} VIP tickers, {len(self.vip_timeframes)} VIP timeframes")

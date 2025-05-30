@@ -129,7 +129,7 @@ class DatabaseConfig:
         self.tickers = []
         self.timeframes = ['1d', '1h']  # Default timeframes
         self.max_tickers = 50
-        self.allowed_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
+        self.allowed_timeframes = ['15m', '30m', '1h', '3h', '6h', '1d', '2d', '3d', '1wk']
         
     async def load_from_database(self):
         """Load configuration from PostgreSQL database"""
@@ -303,10 +303,14 @@ class SignalNotifier:
                 period = '1y'  # 1 year for daily data
             elif timeframe == '1h':
                 period = '1mo'  # 1 month for hourly data
-            elif timeframe in ['15m', '30m', '5m']:
+            elif timeframe in ['15m', '30m']:
                 period = '1wk'  # 1 week for intraday timeframes (faster + more relevant)
-            elif timeframe in ['4h', '2h']:
-                period = '3mo'  # 3 months for medium timeframes
+            elif timeframe in ['3h', '6h']:
+                period = '3mo'  # 3 months for medium hourly timeframes
+            elif timeframe in ['2d', '3d']:
+                period = '1y'  # 1 year for multi-day timeframes
+            elif timeframe == '1wk':
+                period = '5y'  # 5 years for weekly data
             else:
                 period = '1mo'  # Default fallback (1 month)
             
@@ -1627,7 +1631,7 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
     !signals BTC-USD 1h        - Get BTC-USD 1h signals
     """
     # Validate timeframe
-    valid_timeframes = ['1d', '1h', '4h', '15m', '5m']
+    valid_timeframes = ['15m', '30m', '1h', '3h', '6h', '1d', '2d', '3d', '1wk']
     if timeframe not in valid_timeframes:
         await ctx.send(f"❌ Invalid timeframe '{timeframe}'. Valid options: {', '.join(valid_timeframes)}")
         return
