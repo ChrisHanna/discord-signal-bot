@@ -11,7 +11,7 @@ import requests
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from database import record_signal_performance
+from database import record_signal_performance, init_database
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,6 +26,15 @@ async def backfill_real_performance():
     print("=" * 60)
     print("Using REAL historical price data from API")
     print("=" * 60)
+    
+    # 🎯 CRITICAL: Initialize database manager first
+    print("🔄 Initializing database manager...")
+    try:
+        await init_database()
+        print("✅ Database manager initialized successfully")
+    except Exception as e:
+        print(f"❌ Failed to initialize database manager: {e}")
+        return
     
     DATABASE_URL = os.getenv('DATABASE_URL')
     if not DATABASE_URL:
@@ -292,6 +301,9 @@ def find_closest_price(target_datetime: datetime, pricing_data: list):
         closest_price = None
         closest_diff = float('inf')
         
+        # Convert target_datetime to timezone-naive for comparison if it has timezone info
+        target_dt_naive = target_datetime.replace(tzinfo=None) if target_datetime.tzinfo else target_datetime
+        
         for data_point in pricing_data:
             if not isinstance(data_point, dict):
                 continue
@@ -317,6 +329,8 @@ def find_closest_price(target_datetime: datetime, pricing_data: list):
                     if isinstance(timestamp, str):
                         if 'T' in timestamp:
                             dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            # Convert to timezone-naive for comparison
+                            dt = dt.replace(tzinfo=None)
                         elif ' ' in timestamp:
                             dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
                         else:
@@ -327,21 +341,27 @@ def find_closest_price(target_datetime: datetime, pricing_data: list):
                     else:
                         continue
                     
-                    # Calculate time difference
-                    diff = abs((target_datetime - dt).total_seconds())
+                    # Calculate time difference (both datetimes are now timezone-naive)
+                    diff = abs((target_dt_naive - dt).total_seconds())
                     
                     if diff < closest_diff:
                         closest_diff = diff
                         closest_price = float(price)
                         
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    print(f"   ⚠️ Error parsing timestamp '{timestamp}': {e}")
                     continue
         
         # Enhanced tolerance for real data
         max_tolerance = 86400  # 24 hours
         
         if closest_diff < max_tolerance and closest_price is not None:
+            hours_diff = closest_diff / 3600
+            print(f"   🎯 Found price ${closest_price:.2f} within {hours_diff:.1f}h of target time")
             return closest_price
+        else:
+            hours_diff = closest_diff / 3600 if closest_diff != float('inf') else 0
+            print(f"   ⚠️ No price found within tolerance. Closest was {hours_diff:.1f}h away")
         
         return None
         
