@@ -1356,6 +1356,16 @@ class SignalNotifier:
             print(f"❌ Error sending notification: {e}")
             self.stats['errors'] += 1
 
+    async def cleanup_old_notifications(self, days: int = 30) -> int:
+        """Clean up old notifications using database cleanup function"""
+        try:
+            from database import cleanup_old
+            cleaned_count = await cleanup_old(days)
+            return cleaned_count
+        except Exception as e:
+            print(f"❌ Error cleaning up notifications: {e}")
+            return 0
+
 def start_health_server():
     """Health check server temporarily disabled due to timezone issues"""
     print("🏥 Health check server disabled - will re-enable after timezone fixes")
@@ -1480,11 +1490,11 @@ async def signal_check_loop():
         # Create notifier instance
         notifier = SignalNotifier(bot)
         
-        # Periodic cleanup of old notifications (every 10 cycles)
-        if checks_completed % 10 == 0:
-            cleaned_count = notifier.cleanup_old_notifications()
-            if cleaned_count > 0:
-                print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
+        # Periodic cleanup of old notifications (every 10 cycles) - DISABLED
+        # if checks_completed % 10 == 0:
+        #     cleaned_count = await notifier.cleanup_old_notifications()
+        #     if cleaned_count > 0:
+        #         print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
         
         # ✅ NEW: Update daily analytics (every 5 cycles)
         if checks_completed % 5 == 0:
@@ -1502,8 +1512,22 @@ async def signal_check_loop():
         api_errors = 0
         discord_errors = 0
         
+        current_hour = cycle_start.hour
+        
         for ticker in TICKERS:
             for timeframe in TIMEFRAMES:
+                # ⏰ TIMEFRAME-AWARE CHECKING: Only check timeframes at their candle close times
+                if timeframe == '3h' and current_hour % 3 != 0:
+                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 3h candle close hour")
+                    continue
+                elif timeframe == '6h' and current_hour % 6 != 0:
+                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 6h candle close hour")
+                    continue  
+                elif timeframe == '1d' and current_hour % 4 != 0:  # Every 4 hours for stocks (16:xx) and crypto (20:xx)
+                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a daily candle close hour (checks at 00, 04, 08, 12, 16, 20)")
+                    continue
+                # 1h timeframe runs every hour (no skip condition)
+                
                 try:
                     print(f"\n📊 Checking {ticker} ({timeframe})...")
                     
@@ -3619,11 +3643,11 @@ async def smart_signal_check(cycle_count: int, is_priority: bool, reason: str):
         # Create notifier instance
         notifier = SignalNotifier(bot)
         
-        # Periodic cleanup of old notifications (every 10 cycles)
-        if cycle_count % 10 == 0:
-            cleaned_count = notifier.cleanup_old_notifications()
-            if cleaned_count > 0:
-                print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
+        # Periodic cleanup of old notifications (every 10 cycles) - DISABLED
+        # if cycle_count % 10 == 0:
+        #     cleaned_count = await notifier.cleanup_old_notifications()
+        #     if cleaned_count > 0:
+        #         print(f"🧹 Periodic cleanup: removed {cleaned_count} old notification entries")
         
         # ✅ NEW: Update daily analytics (every 5 cycles)
         if cycle_count % 5 == 0:
@@ -3641,8 +3665,22 @@ async def smart_signal_check(cycle_count: int, is_priority: bool, reason: str):
         api_errors = 0
         discord_errors = 0
         
+        current_hour = cycle_start.hour
+        
         for ticker in TICKERS:
             for timeframe in TIMEFRAMES:
+                # ⏰ TIMEFRAME-AWARE CHECKING: Only check timeframes at their candle close times
+                if timeframe == '3h' and current_hour % 3 != 0:
+                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 3h candle close hour")
+                    continue
+                elif timeframe == '6h' and current_hour % 6 != 0:
+                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 6h candle close hour")
+                    continue  
+                elif timeframe == '1d' and current_hour % 4 != 0:  # Every 4 hours for stocks (16:xx) and crypto (20:xx)
+                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a daily candle close hour (checks at 00, 04, 08, 12, 16, 20)")
+                    continue
+                # 1h timeframe runs every hour (no skip condition)
+                
                 try:
                     print(f"\n📊 Checking {ticker} ({timeframe})...")
                     
@@ -5032,6 +5070,310 @@ async def debug_api_response(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
         
     except Exception as e:
         await ctx.send(f"❌ Error debugging API response: {e}")
+
+@bot.command(name='debugperformance')
+async def debug_performance_tracking(ctx, ticker: str = "AAPL"):
+    """Debug command to check if performance tracking is working with real notifications
+    
+    Usage:
+    !debugperformance AAPL - Check AAPL performance tracking
+    !debugperformance TSLA - Check TSLA performance tracking
+    """
+    try:
+        embed = discord.Embed(
+            title=f"🔍 Performance Tracking Debug: {ticker.upper()}",
+            description="Checking connection between notifications and performance data",
+            color=0x9932cc,
+            timestamp=datetime.now(EST)
+        )
+        
+        async with ctx.typing():
+            from database import db_manager
+            
+            async with db_manager.pool.acquire() as conn:
+                # Check recent notifications
+                recent_notifications = await conn.fetch('''
+                    SELECT ticker, timeframe, signal_type, signal_date, notified_at
+                    FROM signal_notifications
+                    WHERE ticker = $1 
+                      AND notified_at >= NOW() - INTERVAL '7 days'
+                    ORDER BY notified_at DESC
+                    LIMIT 5
+                ''', ticker.upper())
+                
+                # Check performance data
+                performance_data = await conn.fetch('''
+                    SELECT ticker, timeframe, signal_type, signal_date, performance_date,
+                           success_1h, success_1d, price_at_signal
+                    FROM signal_performance
+                    WHERE ticker = $1 
+                      AND performance_date >= NOW() - INTERVAL '7 days'
+                    ORDER BY performance_date DESC
+                    LIMIT 5
+                ''', ticker.upper())
+                
+                # Check for pending performance updates
+                pending_updates = await conn.fetch('''
+                    SELECT sn.ticker, sn.timeframe, sn.signal_type, sn.signal_date, sn.notified_at
+                    FROM signal_notifications sn
+                    LEFT JOIN signal_performance sp ON (
+                        sn.ticker = sp.ticker AND 
+                        sn.timeframe = sp.timeframe AND 
+                        sn.signal_type = sp.signal_type AND 
+                        sn.signal_date = sp.signal_date
+                    )
+                    WHERE sn.ticker = $1 
+                      AND sn.notified_at >= NOW() - INTERVAL '7 days'
+                      AND sp.id IS NULL
+                    ORDER BY sn.signal_date DESC
+                    LIMIT 10
+                ''', ticker.upper())
+                
+                # Display results
+                embed.add_field(
+                    name="📬 Recent Notifications (7 days)",
+                    value=f"**Found:** {len(recent_notifications)} notifications\n" + 
+                          (f"**Latest:** {recent_notifications[0]['signal_type']} at {recent_notifications[0]['notified_at'].strftime('%Y-%m-%d %H:%M')}" if recent_notifications else "**Latest:** None"),
+                    inline=False
+                )
+                
+                embed.add_field(
+                    name="📊 Performance Data (7 days)",
+                    value=f"**Found:** {len(performance_data)} performance records\n" +
+                          (f"**Latest:** {performance_data[0]['signal_type']} - 1h: {'✅' if performance_data[0]['success_1h'] else '❌'}, 1d: {'✅' if performance_data[0]['success_1d'] else '❌'}" if performance_data else "**Latest:** None"),
+                    inline=False
+                )
+                
+                embed.add_field(
+                    name="⏳ Pending Performance Updates",
+                    value=f"**Count:** {len(pending_updates)} notifications waiting for performance tracking\n" +
+                          ("\n".join([f"• {p['signal_type']} from {p['signal_date'].strftime('%Y-%m-%d %H:%M')}" for p in pending_updates[:3]]) if pending_updates else "**Status:** All caught up!"),
+                    inline=False
+                )
+                
+                # Determine overall status
+                if len(recent_notifications) == 0:
+                    status = "🟡 No recent notifications to track"
+                    embed.color = 0xffff00
+                elif len(performance_data) == 0:
+                    status = "🔴 Notifications exist but no performance data"
+                    embed.color = 0xff0000
+                elif len(pending_updates) > len(performance_data):
+                    status = "🟡 Performance tracking is behind"
+                    embed.color = 0xffff00
+                else:
+                    status = "🟢 Performance tracking is working"
+                    embed.color = 0x00ff00
+                
+                embed.add_field(
+                    name="🏥 Overall Status",
+                    value=status,
+                    inline=False
+                )
+                
+                # Show recent notification details
+                if recent_notifications:
+                    notification_details = ""
+                    for i, notif in enumerate(recent_notifications[:3]):
+                        has_performance = any(
+                            p['signal_type'] == notif['signal_type'] and 
+                            p['signal_date'].replace(tzinfo=None) == notif['signal_date'].replace(tzinfo=None)
+                            for p in performance_data
+                        )
+                        status_icon = "✅" if has_performance else "⏳"
+                        notification_details += f"{status_icon} {notif['signal_type']} ({notif['timeframe']}) - {notif['notified_at'].strftime('%m/%d %H:%M')}\n"
+                    
+                    embed.add_field(
+                        name="📋 Notification Status",
+                        value=notification_details,
+                        inline=False
+                    )
+        
+        embed.set_footer(text="💡 Use !testperformance to add sample data • !updateanalytics to process existing signals")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error debugging performance tracking: {e}")
+
+@bot.command(name='debugauto')
+async def debug_auto_performance(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
+    """Debug the auto_update_signal_performance method step by step
+    
+    Usage:
+    !debugauto AAPL 1d - Debug AAPL daily performance tracking
+    !debugauto TSLA 1h - Debug TSLA hourly performance tracking
+    """
+    try:
+        embed = discord.Embed(
+            title=f"🔬 Auto Performance Debug: {ticker.upper()} ({timeframe})",
+            description="Step-by-step debugging of automatic performance tracking",
+            color=0xff6600,
+            timestamp=datetime.now(EST)
+        )
+        
+        async with ctx.typing():
+            notifier = SignalNotifier(bot)
+            debug_info = []
+            
+            # Step 1: Check DATABASE_URL
+            import os
+            DATABASE_URL = os.getenv('DATABASE_URL')
+            if DATABASE_URL:
+                debug_info.append("✅ DATABASE_URL environment variable is set")
+            else:
+                debug_info.append("❌ DATABASE_URL environment variable is missing")
+                embed.add_field(name="🔍 Debug Results", value="\n".join(debug_info), inline=False)
+                embed.color = 0xff0000
+                await ctx.send(embed=embed)
+                return
+            
+            # Step 2: Test direct database connection
+            try:
+                import asyncpg
+                conn = await asyncpg.connect(DATABASE_URL)
+                debug_info.append("✅ Direct database connection successful")
+                
+                # Step 3: Check for pending signals
+                pending_signals = await conn.fetch('''
+                    SELECT sn.ticker, sn.timeframe, sn.signal_type, sn.signal_date, sn.notified_at
+                    FROM signal_notifications sn
+                    LEFT JOIN signal_performance sp ON (
+                        sn.ticker = sp.ticker AND 
+                        sn.timeframe = sp.timeframe AND 
+                        sn.signal_type = sp.signal_type AND 
+                        sn.signal_date = sp.signal_date
+                    )
+                    WHERE sn.ticker = $1 
+                      AND sn.timeframe = $2
+                      AND sn.notified_at >= NOW() - INTERVAL '7 days'
+                      AND sp.id IS NULL
+                    ORDER BY sn.signal_date DESC
+                    LIMIT 3
+                ''', ticker.upper(), timeframe)
+                
+                debug_info.append(f"✅ Found {len(pending_signals)} pending signals for {ticker} {timeframe}")
+                
+                if len(pending_signals) == 0:
+                    debug_info.append("⚠️ No pending signals to process - this might be why no performance data")
+                    await conn.close()
+                    embed.add_field(name="🔍 Debug Results", value="\n".join(debug_info), inline=False)
+                    embed.color = 0xffff00
+                    await ctx.send(embed=embed)
+                    return
+                
+                await conn.close()
+                
+            except Exception as e:
+                debug_info.append(f"❌ Database connection failed: {str(e)[:100]}")
+                embed.add_field(name="🔍 Debug Results", value="\n".join(debug_info), inline=False)
+                embed.color = 0xff0000
+                await ctx.send(embed=embed)
+                return
+            
+            # Step 4: Test API call and data extraction
+            try:
+                import requests
+                params = {
+                    'ticker': ticker.upper(),
+                    'interval': timeframe,
+                    'period': '1mo'
+                }
+                response = requests.get(f"{API_BASE_URL}/api/analyzer-b", params=params, timeout=30)
+                
+                if response.status_code == 200:
+                    debug_info.append(f"✅ API call successful (status: {response.status_code})")
+                    
+                    api_data = response.json()
+                    pricing_data = notifier.extract_pricing_data_from_api(api_data)
+                    
+                    if pricing_data:
+                        debug_info.append(f"✅ Pricing data extracted: {len(pricing_data)} data points")
+                        
+                        # Show sample of pricing data
+                        if len(pricing_data) > 0:
+                            sample = pricing_data[0]
+                            sample_keys = list(sample.keys())[:5]
+                            debug_info.append(f"📊 Sample data keys: {', '.join(sample_keys)}")
+                    else:
+                        debug_info.append("❌ Failed to extract pricing data from API response")
+                        # Show API response structure
+                        api_keys = list(api_data.keys())[:5] if isinstance(api_data, dict) else []
+                        debug_info.append(f"🔍 API response keys: {', '.join(api_keys)}")
+                        
+                else:
+                    debug_info.append(f"❌ API call failed (status: {response.status_code})")
+                    
+            except Exception as e:
+                debug_info.append(f"❌ API call error: {str(e)[:100]}")
+            
+            # Step 5: Test performance calculation
+            if 'pricing_data' in locals() and pricing_data and len(pending_signals) > 0:
+                try:
+                    test_signal = pending_signals[0]
+                    signal_datetime = test_signal['signal_date']
+                    
+                    performance = notifier.calculate_performance_from_pricing(
+                        signal_datetime, pricing_data, timeframe
+                    )
+                    
+                    if performance and performance.get('price_at_signal'):
+                        debug_info.append("✅ Performance calculation successful")
+                        debug_info.append(f"📈 Signal price: ${performance['price_at_signal']:.2f}")
+                        debug_info.append(f"📈 1h price: ${performance.get('price_after_1h', 0):.2f}")
+                        debug_info.append(f"📈 1d price: ${performance.get('price_after_1d', 0):.2f}")
+                    else:
+                        debug_info.append("❌ Performance calculation failed")
+                        debug_info.append(f"🔍 Signal datetime: {signal_datetime}")
+                        
+                except Exception as e:
+                    debug_info.append(f"❌ Performance calculation error: {str(e)[:100]}")
+            
+            # Step 6: Test record_signal_performance function
+            if 'performance' in locals() and performance and performance.get('price_at_signal'):
+                try:
+                    from database import record_signal_performance
+                    
+                    # Try to record the performance
+                    success = await record_signal_performance(
+                        ticker=ticker.upper(),
+                        timeframe=timeframe,
+                        signal_type=test_signal['signal_type'],
+                        signal_date=test_signal['signal_date'].strftime('%Y-%m-%d %H:%M:%S'),
+                        price_at_signal=performance['price_at_signal'],
+                        price_after_1h=performance.get('price_after_1h'),
+                        price_after_4h=performance.get('price_after_4h'),
+                        price_after_1d=performance.get('price_after_1d'),
+                        price_after_3d=performance.get('price_after_3d')
+                    )
+                    
+                    if success:
+                        debug_info.append("✅ Performance record saved successfully")
+                    else:
+                        debug_info.append("❌ Failed to save performance record")
+                        
+                except Exception as e:
+                    debug_info.append(f"❌ Record performance error: {str(e)[:100]}")
+        
+        # Format results
+        embed.add_field(
+            name="🔍 Step-by-Step Debug Results",
+            value="\n".join(debug_info[:15]),  # Limit to avoid Discord message limits
+            inline=False
+        )
+        
+        # Determine overall status
+        if "❌" in "\n".join(debug_info):
+            embed.color = 0xff0000
+            embed.add_field(name="🚨 Issues Found", value="Check the failed steps above", inline=False)
+        else:
+            embed.color = 0x00ff00
+            embed.add_field(name="✅ All Steps Passed", value="Performance tracking should be working", inline=False)
+        
+        embed.set_footer(text="💡 This shows exactly where the auto_update_signal_performance method is failing")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error in debug command: {e}")
 
 if __name__ == "__main__":
     import asyncio
