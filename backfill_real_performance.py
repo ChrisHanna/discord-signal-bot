@@ -10,7 +10,11 @@ import asyncpg
 import requests
 import json
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from database import record_signal_performance
+
+# Load environment variables from .env file
+load_dotenv()
 
 # API Configuration
 API_BASE_URL = os.getenv('API_BASE_URL', 'https://wavetrend-216f065b8ba6.herokuapp.com/')

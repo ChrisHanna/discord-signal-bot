@@ -549,6 +549,9 @@ class SignalNotifier:
             closest_price = None
             closest_diff = float('inf')
             
+            # Convert target_datetime to timezone-naive for comparison if it has timezone info
+            target_dt_naive = target_datetime.replace(tzinfo=None) if target_datetime.tzinfo else target_datetime
+            
             for data_point in pricing_data:
                 if not isinstance(data_point, dict):
                     continue
@@ -583,6 +586,8 @@ class SignalNotifier:
                             if 'T' in timestamp:
                                 # ISO format: "2025-05-28T09:30:00Z"
                                 dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                                # Convert to timezone-naive for comparison
+                                dt = dt.replace(tzinfo=None)
                             elif ' ' in timestamp:
                                 # Full datetime: "2025-05-28 09:30:00"
                                 dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
@@ -597,14 +602,15 @@ class SignalNotifier:
                         else:
                             continue
                         
-                        # Calculate time difference
-                        diff = abs((target_datetime - dt).total_seconds())
+                        # Calculate time difference (both datetimes are now timezone-naive)
+                        diff = abs((target_dt_naive - dt).total_seconds())
                         
                         if diff < closest_diff:
                             closest_diff = diff
                             closest_price = float(price)
                             
                     except (ValueError, TypeError) as e:
+                        print(f"⚠️ Error parsing timestamp '{timestamp}': {e}")
                         continue
             
             # 🎯 ENHANCED: More generous time tolerance for daily data
@@ -617,7 +623,8 @@ class SignalNotifier:
                 print(f"🎯 Found price ${closest_price:.2f} within {hours_diff:.1f}h of target time")
                 return closest_price
             else:
-                print(f"⚠️ No price found within tolerance. Closest was {closest_diff/3600:.1f}h away")
+                hours_diff = closest_diff / 3600 if closest_diff != float('inf') else 0
+                print(f"⚠️ No price found within tolerance. Closest was {hours_diff:.1f}h away")
             
             return None
             

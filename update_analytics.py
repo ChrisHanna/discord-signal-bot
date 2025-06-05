@@ -8,6 +8,10 @@ import asyncio
 import os
 import asyncpg
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 async def update_analytics():
     """Update analytics with success rates from existing performance data"""
