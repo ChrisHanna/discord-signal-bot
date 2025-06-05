@@ -4943,24 +4943,24 @@ async def show_success_rates(ctx, days: int = 30):
                             ELSE 'NEUTRAL'
                         END as signal_direction,
                         COUNT(*) as count,
-                        ROUND((COUNT(CASE 
+                        CAST(CAST(COUNT(CASE 
                             WHEN (signal_type ILIKE '%bullish%' OR signal_type ILIKE '%buy%' OR signal_type ILIKE '%oversold%' OR signal_type ILIKE '%entry%')
                                  AND price_after_1h > price_at_signal THEN 1
                             WHEN (signal_type ILIKE '%bearish%' OR signal_type ILIKE '%sell%' OR signal_type ILIKE '%overbought%')
                                  AND price_after_1h < price_at_signal THEN 1
-                        END)::float / COUNT(*)) * 100, 1) as success_1h,
-                        ROUND((COUNT(CASE 
+                        END) AS NUMERIC) / CAST(COUNT(*) AS NUMERIC) * 100 AS NUMERIC(5,1)) as success_1h,
+                        CAST(CAST(COUNT(CASE 
                             WHEN (signal_type ILIKE '%bullish%' OR signal_type ILIKE '%buy%' OR signal_type ILIKE '%oversold%' OR signal_type ILIKE '%entry%')
                                  AND price_after_6h > price_at_signal THEN 1
                             WHEN (signal_type ILIKE '%bearish%' OR signal_type ILIKE '%sell%' OR signal_type ILIKE '%overbought%')
                                  AND price_after_6h < price_at_signal THEN 1
-                        END)::float / COUNT(*)) * 100, 1) as success_6h,
-                        ROUND((COUNT(CASE 
+                        END) AS NUMERIC) / CAST(COUNT(*) AS NUMERIC) * 100 AS NUMERIC(5,1)) as success_6h,
+                        CAST(CAST(COUNT(CASE 
                             WHEN (signal_type ILIKE '%bullish%' OR signal_type ILIKE '%buy%' OR signal_type ILIKE '%oversold%' OR signal_type ILIKE '%entry%')
                                  AND price_after_1d > price_at_signal THEN 1
                             WHEN (signal_type ILIKE '%bearish%' OR signal_type ILIKE '%sell%' OR signal_type ILIKE '%overbought%')
                                  AND price_after_1d < price_at_signal THEN 1
-                        END)::float / COUNT(*)) * 100, 1) as success_1d
+                        END) AS NUMERIC) / CAST(COUNT(*) AS NUMERIC) * 100 AS NUMERIC(5,1)) as success_1d
                     FROM signal_performance
                     WHERE performance_date >= $1
                       AND price_at_signal IS NOT NULL 
@@ -4991,24 +4991,24 @@ async def show_success_rates(ctx, days: int = 30):
                     SELECT 
                         ticker,
                         COUNT(*) as count,
-                        ROUND((COUNT(CASE 
+                        CAST(CAST(COUNT(CASE 
                             WHEN (signal_type ILIKE '%bullish%' OR signal_type ILIKE '%buy%' OR signal_type ILIKE '%oversold%' OR signal_type ILIKE '%entry%')
                                  AND price_after_1h > price_at_signal THEN 1
                             WHEN (signal_type ILIKE '%bearish%' OR signal_type ILIKE '%sell%' OR signal_type ILIKE '%overbought%')
                                  AND price_after_1h < price_at_signal THEN 1
-                        END)::float / COUNT(*)) * 100, 1) as success_1h,
-                        ROUND((COUNT(CASE 
+                        END) AS NUMERIC) / CAST(COUNT(*) AS NUMERIC) * 100 AS NUMERIC(5,1)) as success_1h,
+                        CAST(CAST(COUNT(CASE 
                             WHEN (signal_type ILIKE '%bullish%' OR signal_type ILIKE '%buy%' OR signal_type ILIKE '%oversold%' OR signal_type ILIKE '%entry%')
                                  AND price_after_6h > price_at_signal THEN 1
                             WHEN (signal_type ILIKE '%bearish%' OR signal_type ILIKE '%sell%' OR signal_type ILIKE '%overbought%')
                                  AND price_after_6h < price_at_signal THEN 1
-                        END)::float / COUNT(*)) * 100, 1) as success_6h,
-                        ROUND((COUNT(CASE 
+                        END) AS NUMERIC) / CAST(COUNT(*) AS NUMERIC) * 100 AS NUMERIC(5,1)) as success_6h,
+                        CAST(CAST(COUNT(CASE 
                             WHEN (signal_type ILIKE '%bullish%' OR signal_type ILIKE '%buy%' OR signal_type ILIKE '%oversold%' OR signal_type ILIKE '%entry%')
                                  AND price_after_1d > price_at_signal THEN 1
                             WHEN (signal_type ILIKE '%bearish%' OR signal_type ILIKE '%sell%' OR signal_type ILIKE '%overbought%')
                                  AND price_after_1d < price_at_signal THEN 1
-                        END)::float / COUNT(*)) * 100, 1) as success_1d
+                        END) AS NUMERIC) / CAST(COUNT(*) AS NUMERIC) * 100 AS NUMERIC(5,1)) as success_1d
                     FROM signal_performance
                     WHERE performance_date >= $1
                       AND price_at_signal IS NOT NULL 
