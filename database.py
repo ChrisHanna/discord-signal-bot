@@ -300,32 +300,33 @@ class DatabaseManager:
                                 discord_message_id: int = None, priority_score: int = 0,
                                 priority_level: str = 'MEDIUM', was_vip_ticker: bool = False,
                                 was_vip_timeframe: bool = False, urgency_bonus: int = 0,
-                                pattern_bonus: int = 0) -> bool:
-        """Record a sent notification with enhanced priority tracking"""
+                                pattern_bonus: int = 0, price_at_signal: float = None) -> bool:
+        """Record a notification in the database with enhanced priority tracking and price capture"""
         try:
             async with self.pool.acquire() as conn:
-                # Parse signal date
-                if ' ' in signal_date:
-                    parsed_date = datetime.strptime(signal_date, '%Y-%m-%d %H:%M:%S')
+                # Parse date to ensure proper format
+                if isinstance(signal_date, str):
+                    parsed_date = datetime.strptime(signal_date, '%Y-%m-%d')
                 else:
                     parsed_date = datetime.strptime(signal_date, '%Y-%m-%d')
                 
-                # Insert notification record
+                # Insert notification record with price_at_signal
                 await conn.execute('''
                     INSERT INTO signal_notifications 
                     (ticker, timeframe, signal_type, signal_date, strength, system, 
                      discord_message_id, priority_score, priority_level, was_vip_ticker,
-                     was_vip_timeframe, urgency_bonus, pattern_bonus)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     was_vip_timeframe, urgency_bonus, pattern_bonus, price_at_signal)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                     ON CONFLICT (ticker, timeframe, signal_type, signal_date) 
                     DO UPDATE SET 
                         notified_at = NOW(),
                         discord_message_id = EXCLUDED.discord_message_id,
                         priority_score = EXCLUDED.priority_score,
-                        priority_level = EXCLUDED.priority_level
+                        priority_level = EXCLUDED.priority_level,
+                        price_at_signal = COALESCE(EXCLUDED.price_at_signal, signal_notifications.price_at_signal)
                 ''', ticker, timeframe, signal_type, parsed_date, strength, system, 
                      discord_message_id, priority_score, priority_level, was_vip_ticker,
-                     was_vip_timeframe, urgency_bonus, pattern_bonus)
+                     was_vip_timeframe, urgency_bonus, pattern_bonus, price_at_signal)
                 
                 return True
                 
@@ -1164,12 +1165,12 @@ async def record_notification(ticker: str, timeframe: str, signal_type: str, sig
                             strength: str = None, system: str = None, discord_message_id: int = None,
                             priority_score: int = 0, priority_level: str = 'MEDIUM',
                             was_vip_ticker: bool = False, was_vip_timeframe: bool = False,
-                            urgency_bonus: int = 0, pattern_bonus: int = 0) -> bool:
+                            urgency_bonus: int = 0, pattern_bonus: int = 0, price_at_signal: float = None) -> bool:
     """Record a sent notification with priority data"""
     return await db_manager.record_notification(ticker, timeframe, signal_type, signal_date, 
                                               strength, system, discord_message_id, priority_score,
                                               priority_level, was_vip_ticker, was_vip_timeframe,
-                                              urgency_bonus, pattern_bonus)
+                                              urgency_bonus, pattern_bonus, price_at_signal)
 
 async def record_detected_signal(ticker: str, timeframe: str, signal_type: str, signal_date: str,
                                strength: str, system: str, priority_score: int, priority_level: str,

@@ -1284,6 +1284,25 @@ class SignalNotifier:
             priority_score = calculate_signal_priority(signal, ticker, timeframe)
             priority_display = get_priority_display(priority_score)
             
+            # Capture current price for this signal
+            current_price = None
+            try:
+                # Fetch current data to get the latest price
+                signal_timeline = self.fetch_signal_timeline(ticker, timeframe)
+                if signal_timeline:
+                    # Get the most recent price from the timeline
+                    recent_data = signal_timeline[-1] if signal_timeline else None
+                    if recent_data and 'price' in recent_data:
+                        current_price = float(recent_data['price'])
+                        print(f"📊 Captured current price for {ticker}: ${current_price:.4f}")
+                    else:
+                        print(f"⚠️ Could not extract current price from API data for {ticker}")
+                else:
+                    print(f"⚠️ No signal timeline data available for {ticker}")
+            except Exception as e:
+                print(f"⚠️ Error capturing current price for {ticker}: {e}")
+                # Continue without price - we'll backfill later
+            
             # Format the signal message
             message = self.format_signal_for_discord(signal, ticker, timeframe)
             
@@ -1326,11 +1345,19 @@ class SignalNotifier:
                 inline=True
             )
             
+            # Add current price if captured
+            if current_price:
+                embed.add_field(
+                    name="Price at Signal",
+                    value=f"${current_price:.4f}",
+                    inline=True
+                )
+            
             # Send message and get the message object
             discord_message = await channel.send(embed=embed)
             print(f"📤 Sent priority notification: {ticker} ({timeframe}) - {signal.get('type', 'Unknown')} [Priority: {priority_score.priority_level.name}]")
             
-            # Record this notification in the database with enhanced priority tracking
+            # Record this notification in the database with enhanced priority tracking and current price
             success = await record_notification(
                 ticker=ticker,
                 timeframe=timeframe,
@@ -1344,12 +1371,13 @@ class SignalNotifier:
                 was_vip_ticker=ticker in priority_manager.VIP_TICKERS,
                 was_vip_timeframe=timeframe in priority_manager.VIP_TIMEFRAMES,
                 urgency_bonus=priority_score.urgency_bonus,
-                pattern_bonus=priority_score.pattern_bonus
+                pattern_bonus=priority_score.pattern_bonus,
+                price_at_signal=current_price
             )
             
             if success:
                 self.stats['signals_sent'] += 1
-                print(f"💾 Recorded notification in database")
+                print(f"💾 Recorded notification in database with price: ${current_price:.4f}" if current_price else "💾 Recorded notification in database (price capture failed)")
             else:
                 print(f"⚠️ Failed to record notification in database")
             
@@ -4327,6 +4355,8 @@ async def help_command(ctx):
 `!updateanalytics [DATE]` - Manual analytics update
 `!analyticshealth` - Analytics system health check
 `!successrates [DAYS]` - Signal success rate analysis
+`!correlations [DAYS]` - 🔗 Signal correlation analysis
+`!mlpredict [DAYS]` - 🤖 ML-powered success predictions
 `!testperformance [TICKER]` - Add sample performance data
 `!debugapi [TICKER] [TF]` - Debug API response structure
         """,
@@ -5040,6 +5070,243 @@ async def show_success_rates(ctx, days: int = 30):
     except Exception as e:
         await ctx.send(f"❌ Error getting success rates: {e}")
 
+@bot.command(name='correlations')
+async def signal_correlations(ctx, days: int = 30):
+    """Analyze correlations between signals and identify patterns that work together
+    
+    Usage:
+    !correlations      - Analyze last 30 days
+    !correlations 7    - Analyze last 7 days
+    !correlations 90   - Analyze last 90 days
+    """
+    try:
+        if days < 1 or days > 365:
+            await ctx.send("❌ Days must be between 1 and 365")
+            return
+            
+        embed = discord.Embed(
+            title=f"🔗 Signal Correlation Analysis ({days} days)",
+            description="Advanced correlation patterns and signal combinations",
+            color=0x9932cc,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            from advanced_analytics import advanced_analytics
+            
+            analysis = await advanced_analytics.get_correlation_analysis(days)
+            
+            if "error" in analysis:
+                embed.add_field(
+                    name="❌ Analysis Error",
+                    value=analysis["error"],
+                    inline=False
+                )
+                embed.color = 0xff6600
+            else:
+                # Signal combinations
+                combinations = analysis.get("signal_combinations", {})
+                high_success = combinations.get("high_success_combinations", [])
+                
+                if high_success:
+                    combo_text = ""
+                    for combo in high_success[:5]:  # Top 5
+                        combo_text += f"🎯 **{combo['combination']}**\n"
+                        combo_text += f"   Success: {combo['success_rate']:.1f}% | Return: {combo['avg_return']:.1f}% | Count: {combo['occurrence_count']}\n\n"
+                    
+                    embed.add_field(
+                        name="🚀 High-Success Signal Combinations",
+                        value=combo_text[:1000],
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="🔍 Signal Combinations",
+                        value="No high-success signal combinations found in this period. Try a longer timeframe.",
+                        inline=False
+                    )
+                
+                # Temporal patterns
+                temporal = analysis.get("temporal_patterns", {})
+                best_hours = temporal.get("best_hours", [])
+                best_days = temporal.get("best_days", [])
+                
+                if best_hours:
+                    hours_text = ""
+                    for hour_data in best_hours[:5]:
+                        hours_text += f"⏰ **{hour_data['hour']:02d}:00** - {hour_data['success_rate']:.1f}% success ({hour_data['signal_count']} signals)\n"
+                    
+                    embed.add_field(
+                        name="🕐 Best Hours for Signals",
+                        value=hours_text,
+                        inline=True
+                    )
+                
+                if best_days:
+                    days_text = ""
+                    for day_data in best_days[:5]:
+                        days_text += f"📅 **{day_data['day']}** - {day_data['success_rate']:.1f}% success ({day_data['signal_count']} signals)\n"
+                    
+                    embed.add_field(
+                        name="📆 Best Days for Signals",
+                        value=days_text,
+                        inline=True
+                    )
+                
+                # Ticker correlations
+                ticker_corr = analysis.get("ticker_correlations", {})
+                ticker_success = ticker_corr.get("ticker_success_correlation", [])
+                
+                if ticker_success:
+                    ticker_text = ""
+                    for ticker_data in ticker_success[:6]:
+                        ticker_text += f"📈 **{ticker_data['ticker']}** - {ticker_data['success_rate']:.1f}% ({ticker_data['signal_count']} signals)\n"
+                    
+                    embed.add_field(
+                        name="🏆 Top Performing Tickers",
+                        value=ticker_text,
+                        inline=False
+                    )
+                
+                # Analysis summary
+                embed.add_field(
+                    name="📊 Analysis Summary",
+                    value=f"**Signals Analyzed:** {analysis.get('total_signals_analyzed', 0)}\n**Period:** {analysis.get('analysis_period', 'N/A')}",
+                    inline=False
+                )
+        
+        embed.set_footer(text="💡 Use longer timeframes for more reliable correlation patterns | Combinations require 3+ occurrences")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error analyzing correlations: {e}")
+
+@bot.command(name='mlpredict')
+async def ml_predictions(ctx, days: int = 90):
+    """Use machine learning to predict signal success probability
+    
+    Usage:
+    !mlpredict        - Train on 90 days, predict recent signals
+    !mlpredict 60     - Train on 60 days
+    !mlpredict 180    - Train on 180 days (more data = better accuracy)
+    """
+    try:
+        if days < 30 or days > 365:
+            await ctx.send("❌ Days must be between 30 and 365 for ML training")
+            return
+            
+        embed = discord.Embed(
+            title=f"🤖 ML Signal Predictions ({days}-day training)",
+            description="Machine learning predictions for signal success probability",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            from advanced_analytics import advanced_analytics
+            
+            ml_analysis = await advanced_analytics.get_ml_predictions(days)
+            
+            if "error" in ml_analysis:
+                embed.add_field(
+                    name="❌ ML Analysis Error",
+                    value=ml_analysis["error"],
+                    inline=False
+                )
+                embed.color = 0xff6600
+            else:
+                # Model performance
+                performance = ml_analysis.get("model_performance", {})
+                if performance:
+                    perf_text = ""
+                    for model_name, metrics in performance.items():
+                        perf_text += f"🎯 **{model_name}:**\n"
+                        perf_text += f"   Accuracy: {metrics['accuracy']*100:.1f}%\n"
+                        perf_text += f"   Cross-Val: {metrics['cv_mean']*100:.1f}% ±{metrics['cv_std']*100:.1f}%\n\n"
+                    
+                    embed.add_field(
+                        name="🔬 Model Performance",
+                        value=perf_text,
+                        inline=False
+                    )
+                
+                # Feature importance
+                importance = ml_analysis.get("feature_importance", {})
+                if importance and "Random Forest" in importance:
+                    imp_text = ""
+                    rf_importance = importance["Random Forest"]
+                    feature_names = {
+                        'signal_type_encoded': 'Signal Type',
+                        'ticker_encoded': 'Ticker',
+                        'timeframe_encoded': 'Timeframe',
+                        'signal_hour': 'Hour of Day',
+                        'signal_dow': 'Day of Week',
+                        'signal_direction_encoded': 'Signal Direction'
+                    }
+                    
+                    for feature, imp_val in list(rf_importance.items())[:5]:
+                        display_name = feature_names.get(feature, feature)
+                        imp_text += f"📊 **{display_name}:** {imp_val:.3f}\n"
+                    
+                    embed.add_field(
+                        name="🎯 Most Important Factors",
+                        value=imp_text,
+                        inline=True
+                    )
+                
+                # Recent predictions
+                predictions = ml_analysis.get("predictions", {})
+                recent_preds = predictions.get("recent_predictions", [])
+                
+                if recent_preds:
+                    pred_text = ""
+                    for pred in recent_preds[:8]:  # Top 8 predictions
+                        confidence_emoji = "🔥" if pred['confidence_level'] == 'HIGH' else "⚡" if pred['confidence_level'] == 'MEDIUM' else "💡"
+                        outcome_emoji = "✅" if pred['predicted_outcome'] == 'SUCCESS' else "❌"
+                        actual_emoji = "✅" if pred['actual_outcome'] == 'SUCCESS' else "❌"
+                        
+                        pred_text += f"{confidence_emoji} **{pred['ticker']}** {pred['timeframe']} - {pred['predicted_success_probability']*100:.1f}%\n"
+                        pred_text += f"   {outcome_emoji} Predicted | {actual_emoji} Actual | {pred['signal_type'][:20]}...\n\n"
+                    
+                    embed.add_field(
+                        name="🔮 Recent Predictions (Top Success Probability)",
+                        value=pred_text[:1000],
+                        inline=False
+                    )
+                
+                # Training stats
+                training_stats = ml_analysis.get("training_stats", {})
+                if training_stats:
+                    stats_text = f"**Training Samples:** {training_stats.get('training_samples', 0)}\n"
+                    stats_text += f"**Test Samples:** {training_stats.get('test_samples', 0)}\n"
+                    stats_text += f"**Success Rate in Data:** {training_stats.get('positive_class_ratio', 0)*100:.1f}%"
+                    
+                    embed.add_field(
+                        name="📈 Training Statistics",
+                        value=stats_text,
+                        inline=True
+                    )
+                
+                # Prediction summary
+                if predictions:
+                    summary = predictions.get("prediction_summary", {})
+                    summary_text = f"**Recent Signals:** {summary.get('total_recent_signals', 0)}\n"
+                    summary_text += f"**High Confidence:** {summary.get('high_confidence_predictions', 0)}"
+                    
+                    embed.add_field(
+                        name="📊 Prediction Summary",
+                        value=summary_text,
+                        inline=True
+                    )
+        
+        embed.set_footer(text="🤖 ML models use Random Forest & Gradient Boosting | Higher training days = better accuracy")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error generating ML predictions: {e}")
+
 @bot.command(name='debugapi')
 async def debug_api_response(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
     """Debug command to inspect API response structure for pricing data
@@ -5454,6 +5721,166 @@ async def debug_auto_performance(ctx, ticker: str = "AAPL", timeframe: str = "1d
         
     except Exception as e:
         await ctx.send(f"❌ Error in debug command: {e}")
+
+@bot.command(name='backfill')
+async def performance_backfill(ctx, action: str = None, limit: int = 15, days: int = 3):
+    """Enhanced backfill for ALL timeframes (1h, 3h, 4h, 6h, 1d, 3d)"""
+    if action == "help" or action is None:
+        help_text = """
+🔄 **ENHANCED BACKFILL SYSTEM** 🔄
+
+**Commands:**
+• `!backfill check` - Check data completeness status
+• `!backfill run [limit] [days]` - Run comprehensive backfill
+• `!backfill quick [limit]` - Quick populate recent signals
+
+**What it does:**
+✅ Populates ALL timeframes: 1h, 3h, 4h, 6h, 1d, 3d
+✅ Backfills existing records missing 3h/6h data
+✅ Uses smart interpolation for accurate data
+✅ Calculates success flags for all timeframes
+
+**Examples:**
+• `!backfill run` - Standard backfill (15 signals, 3 days)
+• `!backfill run 50 7` - Backfill 50 signals from last 7 days
+• `!backfill check` - See current data status
+        """
+        
+        embed = discord.Embed(
+            title="🔄 Enhanced Backfill System",
+            description=help_text,
+            color=0x00ff00
+        )
+        await ctx.send(embed=embed)
+        return
+    
+    if action == "check":
+        try:
+            conn = await asyncpg.connect(os.getenv('DATABASE_URL'))
+            
+            # Get comprehensive data status
+            status_query = '''
+                SELECT 
+                    COUNT(*) as total_records,
+                    COUNT(price_after_1h) as has_1h,
+                    COUNT(price_after_3h) as has_3h,
+                    COUNT(price_after_4h) as has_4h,
+                    COUNT(price_after_6h) as has_6h,
+                    COUNT(price_after_1d) as has_1d,
+                    COUNT(price_after_3d) as has_3d,
+                    COUNT(success_1h) as success_1h,
+                    COUNT(success_3h) as success_3h,
+                    COUNT(success_4h) as success_4h,
+                    COUNT(success_6h) as success_6h,
+                    COUNT(success_1d) as success_1d,
+                    COUNT(success_3d) as success_3d
+                FROM signal_performance
+                WHERE performance_date >= NOW() - INTERVAL '30 days'
+            '''
+            
+            result = await conn.fetchrow(status_query)
+            await conn.close()
+            
+            total = result['total_records']
+            if total == 0:
+                await ctx.send("📊 No performance records found in the last 30 days")
+                return
+            
+            # Create status embed
+            embed = discord.Embed(
+                title="📊 Performance Data Status (Last 30 Days)",
+                color=0x3498db
+            )
+            
+            # Price data completeness
+            price_status = f"""
+**Price Data Completeness:**
+• 1h: {result['has_1h']}/{total} ({(result['has_1h']/total*100):.1f}%)
+• 3h: {result['has_3h']}/{total} ({(result['has_3h']/total*100):.1f}%)
+• 4h: {result['has_4h']}/{total} ({(result['has_4h']/total*100):.1f}%)
+• 6h: {result['has_6h']}/{total} ({(result['has_6h']/total*100):.1f}%)
+• 1d: {result['has_1d']}/{total} ({(result['has_1d']/total*100):.1f}%)
+• 3d: {result['has_3d']}/{total} ({(result['has_3d']/total*100):.1f}%)
+            """
+            
+            success_status = f"""
+**Success Flag Completeness:**
+• 1h: {result['success_1h']}/{total} ({(result['success_1h']/total*100):.1f}%)
+• 3h: {result['success_3h']}/{total} ({(result['success_3h']/total*100):.1f}%)
+• 4h: {result['success_4h']}/{total} ({(result['success_4h']/total*100):.1f}%)
+• 6h: {result['success_6h']}/{total} ({(result['success_6h']/total*100):.1f}%)
+• 1d: {result['success_1d']}/{total} ({(result['success_1d']/total*100):.1f}%)
+• 3d: {result['success_3d']}/{total} ({(result['success_3d']/total*100):.1f}%)
+            """
+            
+            embed.add_field(name="📈 Price Data", value=price_status, inline=False)
+            embed.add_field(name="✅ Success Flags", value=success_status, inline=False)
+            
+            # Calculate missing data priority
+            missing_3h = total - result['has_3h']
+            missing_6h = total - result['has_6h']
+            
+            if missing_3h > 0 or missing_6h > 0:
+                embed.add_field(
+                    name="🎯 Recommended Action", 
+                    value=f"Run `!backfill run` to fill {missing_3h + missing_6h} missing 3h/6h records",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="✅ Status", 
+                    value="All critical timeframes are populated!",
+                    inline=False
+                )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            await ctx.send(f"❌ Error checking backfill status: {e}")
+    
+    elif action in ["run", "quick"]:
+        try:
+            # Send processing message
+            processing_msg = await ctx.send(
+                f"🔄 Running enhanced backfill (limit: {limit}, days: {days})..."
+            )
+            
+            # Import and run the enhanced quick populate
+            import sys
+            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+            from quick_populate_performance import quick_populate
+            result = await quick_populate(limit=limit, days_back=days)
+            
+            # Update processing message with results
+            embed = discord.Embed(
+                title="✅ Enhanced Backfill Complete!",
+                color=0x00ff00
+            )
+            
+            embed.add_field(
+                name="📊 Results Summary",
+                value=f"""
+• **New Records Created:** {result['created']}
+• **Existing Records Backfilled:** {result['backfilled']}
+• **Total Improvements:** {result['total']}
+
+✅ All timeframes populated: 1h, 3h, 4h, 6h, 1d, 3d
+🎯 Now run `!successrates` to see updated analytics!
+                """,
+                inline=False
+            )
+            
+            await processing_msg.edit(content="", embed=embed)
+            
+        except Exception as e:
+            await ctx.send(f"❌ Backfill failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+    else:
+        await ctx.send(
+            "❓ Unknown action. Use `!backfill help` for usage instructions."
+        )
 
 if __name__ == "__main__":
     import asyncio
