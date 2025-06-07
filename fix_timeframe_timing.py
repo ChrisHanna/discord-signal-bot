@@ -38,10 +38,10 @@ def patch_signal_notifier():
     pattern2 = r'(\s+for ticker in TICKERS:\s+for timeframe in TIMEFRAMES:\s+)(try:)'
     
     replacement2 = r'''\1# ⏰ TIMEFRAME-AWARE CHECKING: Only check timeframes at their candle close times
-                if timeframe == '3h' and current_hour % 3 != 0:
+                if timeframe == '3h' and current_hour not in [23, 2, 5, 8, 11, 14, 17, 20]:
                     print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 3h candle close hour")
                     continue
-                elif timeframe == '6h' and current_hour % 6 != 0:
+                elif timeframe == '6h' and current_hour not in [2, 8, 14, 20]:
                     print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 6h candle close hour")
                     continue  
                 elif timeframe == '1d' and current_hour != 16:  # 4 PM EST market close
