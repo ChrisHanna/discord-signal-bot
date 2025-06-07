@@ -23,6 +23,7 @@ import atexit
 from dateutil import parser
 import logging
 import asyncpg
+import numpy as np
 
 # Import database functionality
 from database import init_database, check_duplicate, record_notification, get_stats, cleanup_old, record_detected_signal, get_priority_analytics, get_signal_utilization, add_ticker_to_database, remove_ticker_from_database, get_database_tickers, save_vip_tickers_to_database, get_vip_tickers_from_database, save_priority_settings_to_database, update_daily_analytics, get_best_performing_signals, get_signal_performance_summary, cleanup_old_analytics, record_signal_performance
@@ -1124,7 +1125,7 @@ class SignalNotifier:
             return []
 
     async def should_notify(self, signal: Dict, ticker: str, timeframe: str) -> bool:
-        """Enhanced signal filtering with priority-based notification system and comprehensive tracking"""
+        """Enhanced signal filtering with priority-based notification system, comprehensive tracking, and ML-based filtering"""
         if not signal:
             return False
         
@@ -1140,6 +1141,47 @@ class SignalNotifier:
         # Calculate priority score first
         should_send, priority_score = should_send_notification(signal, ticker, timeframe)
         
+        # 🤖 NEW: Get ML prediction for filtering
+        ml_prediction = None
+        ml_should_send = True  # Default to True if ML fails
+        
+        try:
+            from advanced_analytics import advanced_analytics
+            
+            # Create signal features for ML prediction
+            signal_features = {
+                'ticker': ticker,
+                'timeframe': timeframe,
+                'signal_type': signal_type,
+                'strength': strength,
+                'system': system,
+                'signal_date': signal_date
+            }
+            
+            # Get ML prediction
+            ml_result = await advanced_analytics.predict_single_signal(signal_features)
+            if ml_result and 'prediction' in ml_result:
+                ml_prediction = ml_result['prediction']
+                
+                # ML filtering logic
+                success_prob = ml_prediction['success_probability']
+                risk_level = ml_prediction.get('risk_level', 'medium')
+                confidence = ml_prediction.get('confidence', 'medium')
+                
+                # Don't send high-risk signals with low success probability
+                if risk_level == 'high' and success_prob < 0.4:
+                    ml_should_send = False
+                    print(f"🤖 ML Filter: Blocking high-risk signal {ticker} {signal_type} - {success_prob*100:.1f}% success, {risk_level} risk")
+                
+                # Boost high-confidence, high-success signals
+                elif success_prob >= 0.7 and confidence == 'high':
+                    ml_should_send = True
+                    print(f"🤖 ML Boost: Promoting high-confidence signal {ticker} {signal_type} - {success_prob*100:.1f}% success")
+                
+        except Exception as e:
+            print(f"⚠️ ML filtering failed for {ticker}: {e}")
+            # Continue with regular filtering if ML fails
+        
         # Check for duplicate in database
         is_duplicate = await check_duplicate(ticker, timeframe, signal_type, signal_date)
         
@@ -1151,6 +1193,8 @@ class SignalNotifier:
             skip_reason = "duplicate_notification"
         elif not should_send:
             skip_reason = f"priority_below_threshold_{priority_score.priority_level.name.lower()}"
+        elif not ml_should_send:
+            skip_reason = "ml_filter_rejected_high_risk"
         else:
             will_send = True
         
@@ -1175,14 +1219,21 @@ class SignalNotifier:
                 'urgency_bonus': priority_score.urgency_bonus,
                 'pattern_bonus': priority_score.pattern_bonus,
                 'is_vip_ticker': ticker in priority_manager.VIP_TICKERS,
-                'is_vip_timeframe': timeframe in priority_manager.VIP_TIMEFRAMES
+                'is_vip_timeframe': timeframe in priority_manager.VIP_TIMEFRAMES,
+                # 🤖 NEW: Store ML prediction data
+                'ml_success_probability': ml_prediction['success_probability'] if ml_prediction else None,
+                'ml_confidence': ml_prediction.get('confidence') if ml_prediction else None,
+                'ml_risk_level': ml_prediction.get('risk_level') if ml_prediction else None,
+                'ml_sample_size': ml_prediction.get('sample_size') if ml_prediction else None
             }
         )
         
         if will_send:
-            print(f"🎯 Priority notification: {ticker} {signal_type} - Priority: {priority_score.priority_level.name} (Score: {priority_score.total_score})")
+            ml_info = f" | ML: {ml_prediction['success_probability']*100:.1f}%" if ml_prediction else ""
+            print(f"🎯 Priority notification: {ticker} {signal_type} - Priority: {priority_score.priority_level.name} (Score: {priority_score.total_score}){ml_info}")
         else:
-            print(f"⏸️ Skipped signal: {ticker} {signal_type} - Priority: {priority_score.priority_level.name} (Score: {priority_score.total_score}) - Reason: {skip_reason}")
+            ml_info = f" | ML: {ml_prediction['success_probability']*100:.1f}%" if ml_prediction else ""
+            print(f"⏸️ Skipped signal: {ticker} {signal_type} - Priority: {priority_score.priority_level.name} (Score: {priority_score.total_score}){ml_info} - Reason: {skip_reason}")
         
         return will_send
     
@@ -1310,15 +1361,15 @@ class SignalNotifier:
             message += f"\n{priority_display}"
             
             # Determine embed color based on priority level
-            priority_colors = {
-                'CRITICAL': 0xFF0000,  # Red
-                'HIGH': 0xFF6600,      # Orange  
-                'MEDIUM': 0x0099FF,    # Blue
-                'LOW': 0x00FF00,       # Green
-                'MINIMAL': 0x808080    # Gray
-            }
+                priority_colors = {
+                    'CRITICAL': 0xFF0000,  # Red
+                    'HIGH': 0xFF6600,      # Orange  
+                    'MEDIUM': 0x0099FF,    # Blue
+                    'LOW': 0x00FF00,       # Green
+                    'MINIMAL': 0x808080    # Gray
+                }
             
-            color = priority_colors.get(priority_score.priority_level.name, 0x0099ff)
+                color = priority_colors.get(priority_score.priority_level.name, 0x0099ff)
             
             # Create Discord embed
             embed = discord.Embed(
@@ -1754,7 +1805,7 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
             except:
                 continue
         
-        embed.add_field(
+                embed.add_field(
             name="📊 Signal Summary", 
             value=f"**Total Found:** {total_signals} signals\n"
                   f"**Today:** {today_signals} signals\n"
@@ -1817,8 +1868,8 @@ async def get_signals(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
                       f"**Strength:** {strength}\n"
                       f"**When:** {timing_display}\n"
                       f"{date_display}",
-                inline=True
-            )
+                    inline=True
+                )
         
         # Add navigation footer
         if total_signals > showing_count:
@@ -1850,12 +1901,12 @@ async def show_timer(ctx):
             timestamp=datetime.now(EST)
         )
         
-        embed.add_field(
+                embed.add_field(
             name="⏳ Next Check",
             value=f"`{status_info['time_until_next']}`",
-            inline=True
-        )
-        
+                    inline=True
+                )
+            
         embed.add_field(
             name="🕐 Next Check Time (EST)",
             value=f"`{status_info['next_run_time']}`",
@@ -4355,7 +4406,7 @@ async def help_command(ctx):
 `!updateanalytics [DATE]` - Manual analytics update
 `!analyticshealth` - Analytics system health check
 `!successrates [DAYS]` - Signal success rate analysis
-`!correlations [DAYS]` - 🔗 Signal correlation analysis
+`!correlations [DAYS]` - 🔗 Enhanced correlation analysis with ML patterns, market conditions & statistical validation
 `!mlpredict [DAYS]` - 🤖 ML-powered success predictions
 `!testperformance [TICKER]` - Add sample performance data
 `!debugapi [TICKER] [TF]` - Debug API response structure
@@ -5085,8 +5136,8 @@ async def signal_correlations(ctx, days: int = 30):
             return
             
         embed = discord.Embed(
-            title=f"🔗 Signal Correlation Analysis ({days} days)",
-            description="Advanced correlation patterns and signal combinations",
+            title=f"🔗 Enhanced Signal Correlation Analysis ({days} days)",
+            description="Advanced correlation patterns, market conditions & signal intelligence",
             color=0x9932cc,
             timestamp=datetime.now(EST)
         )
@@ -5105,14 +5156,18 @@ async def signal_correlations(ctx, days: int = 30):
                 )
                 embed.color = 0xff6600
             else:
+                # Data Quality Score (NEW)
+                quality_score = analysis.get("data_quality_score", 0)
+                quality_emoji = "🟢" if quality_score >= 0.8 else "🟡" if quality_score >= 0.6 else "🔴"
+                
                 # Signal combinations
                 combinations = analysis.get("signal_combinations", {})
                 high_success = combinations.get("high_success_combinations", [])
                 
                 if high_success:
                     combo_text = ""
-                    for combo in high_success[:5]:  # Top 5
-                        combo_text += f"🎯 **{combo['combination']}**\n"
+                    for combo in high_success[:4]:  # Top 4 to save space
+                        combo_text += f"🎯 **{combo['combination'][:35]}**\n"
                         combo_text += f"   Success: {combo['success_rate']:.1f}% | Return: {combo['avg_return']:.1f}% | Count: {combo['occurrence_count']}\n\n"
                     
                     embed.add_field(
@@ -5120,63 +5175,136 @@ async def signal_correlations(ctx, days: int = 30):
                         value=combo_text[:1000],
                         inline=False
                     )
-                else:
-                    embed.add_field(
-                        name="🔍 Signal Combinations",
-                        value="No high-success signal combinations found in this period. Try a longer timeframe.",
-                        inline=False
-                    )
                 
-                # Temporal patterns
+                # NEW: Strength Analysis
+                strength_analysis = analysis.get("strength_analysis", {})
+                if strength_analysis:
+                    strength_corr = strength_analysis.get("strength_correlation", {})
+                    optimal_strengths = strength_analysis.get("optimal_strength_ranges", [])
+                    
+                    if optimal_strengths:
+                        strength_text = ""
+                        for strength in optimal_strengths[:3]:
+                            strength_text += f"💪 **Strength {strength['range']}:** {strength['success_rate']:.1f}% success, {strength['avg_return']:.1f}% return ({strength['count']} signals)\n"
+                        
+                        embed.add_field(
+                            name="💪 Optimal Signal Strengths",
+                            value=strength_text,
+                            inline=True
+                        )
+                
+                # NEW: Market Conditions Analysis
+                market_conditions = analysis.get("market_conditions", {})
+                if market_conditions:
+                    volatility_performance = market_conditions.get("volatility_performance", [])
+                    market_regime = market_conditions.get("market_regime_analysis", {})
+                    
+                    if volatility_performance:
+                        vol_text = ""
+                        for vol in volatility_performance[:3]:
+                            vol_emoji = "🔥" if vol['category'] == 'High' else "⚡" if vol['category'] == 'Medium' else "🌊"
+                            vol_text += f"{vol_emoji} **{vol['category']} Vol:** {vol['success_rate']:.1f}% success, {vol['avg_return']:.1f}% return\n"
+                        
+                        embed.add_field(
+                            name="🌊 Market Volatility Impact",
+                            value=vol_text,
+                            inline=True
+                        )
+                
+                # Temporal patterns (enhanced)
                 temporal = analysis.get("temporal_patterns", {})
                 best_hours = temporal.get("best_hours", [])
                 best_days = temporal.get("best_days", [])
                 
                 if best_hours:
                     hours_text = ""
-                    for hour_data in best_hours[:5]:
-                        hours_text += f"⏰ **{hour_data['hour']:02d}:00** - {hour_data['success_rate']:.1f}% success ({hour_data['signal_count']} signals)\n"
+                    for hour_data in best_hours[:4]:
+                        time_emoji = "🌅" if 6 <= hour_data['hour'] <= 11 else "☀️" if 12 <= hour_data['hour'] <= 17 else "🌙"
+                        hours_text += f"{time_emoji} **{hour_data['hour']:02d}:00** - {hour_data['success_rate']:.1f}% ({hour_data['signal_count']} signals)\n"
                     
                     embed.add_field(
-                        name="🕐 Best Hours for Signals",
+                        name="🕐 Peak Performance Hours",
                         value=hours_text,
                         inline=True
                     )
                 
                 if best_days:
                     days_text = ""
-                    for day_data in best_days[:5]:
-                        days_text += f"📅 **{day_data['day']}** - {day_data['success_rate']:.1f}% success ({day_data['signal_count']} signals)\n"
+                    for day_data in best_days[:4]:
+                        day_emoji = "📈" if day_data['success_rate'] > 50 else "📊"
+                        days_text += f"{day_emoji} **{day_data['day'][:3]}** - {day_data['success_rate']:.1f}% ({day_data['signal_count']} signals)\n"
                     
                     embed.add_field(
-                        name="📆 Best Days for Signals",
+                        name="📆 Best Trading Days",
                         value=days_text,
                         inline=True
                     )
                 
-                # Ticker correlations
+                # NEW: System Performance Analysis
+                system_performance = analysis.get("system_performance", {})
+                if system_performance:
+                    system_rankings = system_performance.get("system_rankings", [])
+                    
+                    if system_rankings:
+                        system_text = ""
+                        for system in system_rankings[:4]:
+                            sys_emoji = "🥇" if system['rank'] == 1 else "🥈" if system['rank'] == 2 else "🥉" if system['rank'] == 3 else "🏅"
+                            system_text += f"{sys_emoji} **{system['system']}:** {system['success_rate']:.1f}% success ({system['signal_count']} signals)\n"
+                        
+                        embed.add_field(
+                            name="🎯 Top Signal Systems",
+                            value=system_text,
+                            inline=True
+                        )
+                
+                # Ticker correlations (enhanced)
                 ticker_corr = analysis.get("ticker_correlations", {})
                 ticker_success = ticker_corr.get("ticker_success_correlation", [])
                 
                 if ticker_success:
                     ticker_text = ""
-                    for ticker_data in ticker_success[:6]:
-                        ticker_text += f"📈 **{ticker_data['ticker']}** - {ticker_data['success_rate']:.1f}% ({ticker_data['signal_count']} signals)\n"
+                    for ticker_data in ticker_success[:5]:
+                        perf_emoji = "🚀" if ticker_data['success_rate'] > 60 else "📈" if ticker_data['success_rate'] > 40 else "📊"
+                        ticker_text += f"{perf_emoji} **{ticker_data['ticker']}** - {ticker_data['success_rate']:.1f}% ({ticker_data['signal_count']} signals)\n"
                     
                     embed.add_field(
-                        name="🏆 Top Performing Tickers",
+                        name="🏆 Top Performing Assets",
                         value=ticker_text,
-                        inline=False
+                        inline=True
                     )
                 
-                # Analysis summary
+                # NEW: Statistical Significance & Volatility Patterns
+                stats_sig = analysis.get("statistical_significance", {})
+                volatility_patterns = analysis.get("volatility_patterns", {})
+                
+                insights_text = ""
+                
+                if stats_sig:
+                    confidence_level = stats_sig.get("overall_confidence", "Medium")
+                    conf_emoji = "🟢" if confidence_level == "High" else "🟡" if confidence_level == "Medium" else "🔴"
+                    insights_text += f"{conf_emoji} **Statistical Confidence:** {confidence_level}\n"
+                
+                if volatility_patterns:
+                    vol_trend = volatility_patterns.get("trend", "Neutral")
+                    trend_emoji = "📈" if vol_trend == "Increasing" else "📉" if vol_trend == "Decreasing" else "➡️"
+                    insights_text += f"{trend_emoji} **Market Volatility Trend:** {vol_trend}\n"
+                
+                # Analysis summary with enhanced metrics
+                summary_text = f"""
+**Signals Analyzed:** {analysis.get('total_signals_analyzed', 0):,}
+**Analysis Period:** {analysis.get('analysis_period', 'N/A')}
+**Data Quality:** {quality_emoji} {quality_score*100:.0f}%"""
+                
+                if insights_text:
+                    summary_text += f"\n\n**Key Insights:**\n{insights_text}"
+                
                 embed.add_field(
                     name="📊 Analysis Summary",
-                    value=f"**Signals Analyzed:** {analysis.get('total_signals_analyzed', 0)}\n**Period:** {analysis.get('analysis_period', 'N/A')}",
+                    value=summary_text,
                     inline=False
                 )
         
-        embed.set_footer(text="💡 Use longer timeframes for more reliable correlation patterns | Combinations require 3+ occurrences")
+        embed.set_footer(text="🔬 Enhanced with ML patterns, volatility analysis & statistical validation | Use longer timeframes for higher confidence")
         await ctx.send(embed=embed)
         
     except Exception as e:
@@ -5184,12 +5312,13 @@ async def signal_correlations(ctx, days: int = 30):
 
 @bot.command(name='mlpredict')
 async def ml_predictions(ctx, days: int = 90):
-    """Use machine learning to predict signal success probability
+    """Enhanced machine learning predictions for signal success probability
     
     Usage:
     !mlpredict        - Train on 90 days, predict recent signals
-    !mlpredict 60     - Train on 60 days
-    !mlpredict 180    - Train on 180 days (more data = better accuracy)
+    !mlpredict 60     - Train on 60 days (faster training)
+    !mlpredict 180    - Train on 180 days (higher accuracy)
+    !mlpredict 365    - Train on full year (maximum accuracy)
     """
     try:
         if days < 30 or days > 365:
@@ -5197,8 +5326,8 @@ async def ml_predictions(ctx, days: int = 90):
             return
             
         embed = discord.Embed(
-            title=f"🤖 ML Signal Predictions ({days}-day training)",
-            description="Machine learning predictions for signal success probability",
+            title=f"🤖 Enhanced ML Signal Predictions ({days}-day training)",
+            description="Advanced machine learning predictions with risk analysis & ensemble voting",
             color=0x00ff88,
             timestamp=datetime.now(EST)
         )
@@ -5217,95 +5346,170 @@ async def ml_predictions(ctx, days: int = 90):
                 )
                 embed.color = 0xff6600
             else:
-                # Model performance
+                # Enhanced Model performance
                 performance = ml_analysis.get("model_performance", {})
                 if performance:
                     perf_text = ""
+                    best_model = None
+                    best_score = 0
+                    
                     for model_name, metrics in performance.items():
-                        perf_text += f"🎯 **{model_name}:**\n"
-                        perf_text += f"   Accuracy: {metrics['accuracy']*100:.1f}%\n"
-                        perf_text += f"   Cross-Val: {metrics['cv_mean']*100:.1f}% ±{metrics['cv_std']*100:.1f}%\n\n"
+                        accuracy = metrics.get('accuracy', 0)
+                        cv_mean = metrics.get('cv_mean', 0)
+                        auc = metrics.get('auc_score', accuracy)  # Fallback to accuracy if AUC not available
+                        
+                        # Determine best model
+                        combined_score = (accuracy + cv_mean + auc) / 3
+                        if combined_score > best_score:
+                            best_score = combined_score
+                            best_model = model_name
+                        
+                        # Model performance display
+                        perf_emoji = "🥇" if model_name == best_model else "🥈" if combined_score > 0.6 else "🥉"
+                        perf_text += f"{perf_emoji} **{model_name}:**\n"
+                        perf_text += f"   Accuracy: {accuracy*100:.1f}% | AUC: {auc*100:.1f}%\n"
+                        perf_text += f"   Cross-Val: {cv_mean*100:.1f}% ±{metrics.get('cv_std', 0)*100:.1f}%\n\n"
                     
                     embed.add_field(
-                        name="🔬 Model Performance",
+                        name="🔬 Model Performance Rankings",
                         value=perf_text,
                         inline=False
                     )
                 
-                # Feature importance
+                # Enhanced Feature importance with categories
                 importance = ml_analysis.get("feature_importance", {})
                 if importance and "Random Forest" in importance:
                     imp_text = ""
                     rf_importance = importance["Random Forest"]
-                    feature_names = {
-                        'signal_type_encoded': 'Signal Type',
-                        'ticker_encoded': 'Ticker',
-                        'timeframe_encoded': 'Timeframe',
-                        'signal_hour': 'Hour of Day',
-                        'signal_dow': 'Day of Week',
-                        'signal_direction_encoded': 'Signal Direction'
+                    feature_categories = {
+                        'signal_type_encoded': ('🎯', 'Signal Type'),
+                        'ticker_encoded': ('📈', 'Asset'),
+                        'timeframe_encoded': ('⏱️', 'Timeframe'),
+                        'signal_hour': ('🕐', 'Hour of Day'),
+                        'signal_dow': ('📅', 'Day of Week'),
+                        'signal_direction_encoded': ('📊', 'Signal Direction'),
+                        'strength': ('💪', 'Signal Strength'),
+                        'system_encoded': ('🔧', 'Signal System'),
+                        'volatility_score': ('🌊', 'Volatility'),
+                        'momentum_score': ('🚀', 'Momentum'),
+                        'market_sentiment': ('😊', 'Market Sentiment'),
+                        'signal_frequency': ('📡', 'Signal Frequency'),
+                        'historical_success_rate': ('📚', 'Historical Success'),
+                        'risk_score': ('⚠️', 'Risk Score')
                     }
                     
-                    for feature, imp_val in list(rf_importance.items())[:5]:
-                        display_name = feature_names.get(feature, feature)
-                        imp_text += f"📊 **{display_name}:** {imp_val:.3f}\n"
+                    for feature, imp_val in list(rf_importance.items())[:6]:
+                        emoji, display_name = feature_categories.get(feature, ('📊', feature))
+                        imp_text += f"{emoji} **{display_name}:** {imp_val:.3f}\n"
                     
                     embed.add_field(
-                        name="🎯 Most Important Factors",
+                        name="🎯 Most Predictive Factors",
                         value=imp_text,
                         inline=True
                     )
                 
-                # Recent predictions
+                # Ensemble & Risk Analysis (NEW)
+                ensemble = ml_analysis.get("ensemble_predictions", {})
+                risk_analysis = ml_analysis.get("risk_analysis", {})
+                
+                if ensemble or risk_analysis:
+                    insights_text = ""
+                    
+                    if ensemble:
+                        ensemble_acc = ensemble.get("ensemble_accuracy", 0)
+                        improvement = ensemble.get("improvement_over_best", 0)
+                        insights_text += f"🤝 **Ensemble Accuracy:** {ensemble_acc*100:.1f}%\n"
+                        if improvement > 0:
+                            insights_text += f"📈 **Improvement:** +{improvement*100:.1f}%\n"
+                    
+                    if risk_analysis:
+                        risk_dist = risk_analysis.get("risk_distribution", {})
+                        if risk_dist:
+                            insights_text += f"⚠️ **High Risk Signals:** {risk_dist.get('high_risk', 0)*100:.0f}%\n"
+                            insights_text += f"✅ **Low Risk Signals:** {risk_dist.get('low_risk', 0)*100:.0f}%\n"
+                    
+                    if insights_text:
+                        embed.add_field(
+                            name="🧠 ML Insights & Risk Analysis",
+                            value=insights_text,
+                            inline=True
+                        )
+                
+                # Enhanced Recent predictions with risk levels
                 predictions = ml_analysis.get("predictions", {})
                 recent_preds = predictions.get("recent_predictions", [])
                 
                 if recent_preds:
                     pred_text = ""
-                    for pred in recent_preds[:8]:  # Top 8 predictions
-                        confidence_emoji = "🔥" if pred['confidence_level'] == 'HIGH' else "⚡" if pred['confidence_level'] == 'MEDIUM' else "💡"
+                    for pred in recent_preds[:10]:  # Top 10 predictions
+                        # Enhanced confidence and risk display
+                        prob = pred.get('ensemble_success_probability', pred.get('predicted_success_probability', 0))
+                        confidence = pred.get('confidence_level', 'MEDIUM')
+                        risk_level = pred.get('risk_level', 'MEDIUM')
+                        
+                        # Smart emoji selection
+                        confidence_emoji = "🔥" if confidence == 'HIGH' else "⚡" if confidence == 'MEDIUM' else "💡"
+                        risk_emoji = "🟢" if risk_level == 'LOW' else "🟡" if risk_level == 'MEDIUM' else "🔴"
                         outcome_emoji = "✅" if pred['predicted_outcome'] == 'SUCCESS' else "❌"
                         actual_emoji = "✅" if pred['actual_outcome'] == 'SUCCESS' else "❌"
                         
-                        pred_text += f"{confidence_emoji} **{pred['ticker']}** {pred['timeframe']} - {pred['predicted_success_probability']*100:.1f}%\n"
-                        pred_text += f"   {outcome_emoji} Predicted | {actual_emoji} Actual | {pred['signal_type'][:20]}...\n\n"
+                        pred_text += f"{confidence_emoji}{risk_emoji} **{pred['ticker']}** {pred['timeframe']} - {prob*100:.1f}%\n"
+                        pred_text += f"   {outcome_emoji} Predicted | {actual_emoji} Actual | Risk: {risk_level}\n\n"
                     
                     embed.add_field(
-                        name="🔮 Recent Predictions (Top Success Probability)",
+                        name="🔮 Recent ML Predictions (🔥=High Conf, 🟢=Low Risk)",
                         value=pred_text[:1000],
                         inline=False
                     )
                 
-                # Training stats
+                # Enhanced Training & Prediction stats
                 training_stats = ml_analysis.get("training_stats", {})
+                pred_summary = predictions.get("prediction_summary", {}) if predictions else {}
+                
+                stats_text = ""
                 if training_stats:
-                    stats_text = f"**Training Samples:** {training_stats.get('training_samples', 0)}\n"
-                    stats_text += f"**Test Samples:** {training_stats.get('test_samples', 0)}\n"
-                    stats_text += f"**Success Rate in Data:** {training_stats.get('positive_class_ratio', 0)*100:.1f}%"
-                    
+                    stats_text += f"**Training Data:** {training_stats.get('training_samples', 0):,} signals\n"
+                    stats_text += f"**Success Rate:** {training_stats.get('positive_class_ratio', 0)*100:.1f}%\n"
+                    stats_text += f"**Features Used:** {training_stats.get('feature_count', 9)}\n"
+                
+                if pred_summary:
+                    stats_text += f"**Recent Signals:** {pred_summary.get('total_recent_signals', 0)}\n"
+                    stats_text += f"**High Confidence:** {pred_summary.get('high_confidence_predictions', 0)}\n"
+                    stats_text += f"**Low Risk:** {pred_summary.get('low_risk_predictions', 0)}"
+                
+                if stats_text:
                     embed.add_field(
-                        name="📈 Training Statistics",
+                        name="📊 Training & Prediction Statistics",
                         value=stats_text,
                         inline=True
                     )
                 
-                # Prediction summary
-                if predictions:
-                    summary = predictions.get("prediction_summary", {})
-                    summary_text = f"**Recent Signals:** {summary.get('total_recent_signals', 0)}\n"
-                    summary_text += f"**High Confidence:** {summary.get('high_confidence_predictions', 0)}"
+                # Actionable recommendations (NEW)
+                if recent_preds:
+                    recommendations = []
+                    high_conf_low_risk = [p for p in recent_preds if p.get('confidence_level') == 'HIGH' and p.get('risk_level') == 'LOW']
+                    avoid_signals = [p for p in recent_preds if p.get('risk_level') == 'HIGH' and p.get('ensemble_success_probability', 0) < 0.4]
                     
-                    embed.add_field(
-                        name="📊 Prediction Summary",
-                        value=summary_text,
-                        inline=True
-                    )
+                    if high_conf_low_risk:
+                        recommendations.append(f"🎯 **Best Bets:** {len(high_conf_low_risk)} high-confidence, low-risk signals")
+                    if avoid_signals:
+                        recommendations.append(f"⚠️ **Avoid:** {len(avoid_signals)} high-risk signals")
+                    if len(recent_preds) > 0:
+                        avg_prob = np.mean([p.get('ensemble_success_probability', 0) for p in recent_preds])
+                        recommendations.append(f"📈 **Market Outlook:** {avg_prob*100:.0f}% avg success probability")
+                    
+                    if recommendations:
+                        embed.add_field(
+                            name="💡 Actionable Recommendations",
+                            value="\n".join(recommendations),
+                            inline=False
+                        )
         
-        embed.set_footer(text="🤖 ML models use Random Forest & Gradient Boosting | Higher training days = better accuracy")
+        embed.set_footer(text="🤖 Enhanced ML with ensemble voting, risk analysis & advanced features | More training data = higher accuracy")
         await ctx.send(embed=embed)
         
     except Exception as e:
-        await ctx.send(f"❌ Error generating ML predictions: {e}")
+        await ctx.send(f"❌ Error generating enhanced ML predictions: {e}")
 
 @bot.command(name='debugapi')
 async def debug_api_response(ctx, ticker: str = "AAPL", timeframe: str = "1d"):
@@ -5683,7 +5887,7 @@ async def debug_auto_performance(ctx, ticker: str = "AAPL", timeframe: str = "1d
                     # Try to record the performance
                     success = await record_signal_performance(
                         ticker=ticker.upper(),
-                        timeframe=timeframe,
+                timeframe=timeframe,
                         signal_type=test_signal['signal_type'],
                         signal_date=test_signal['signal_date'].strftime('%Y-%m-%d %H:%M:%S'),
                         price_at_signal=performance['price_at_signal'],
@@ -5881,6 +6085,283 @@ async def performance_backfill(ctx, action: str = None, limit: int = 15, days: i
         await ctx.send(
             "❓ Unknown action. Use `!backfill help` for usage instructions."
         )
+
+@bot.command(name='besttimes')
+async def ml_best_times(ctx, days: int = 30):
+    """🕐 ML-powered analysis of best times to send signals
+    
+    Usage:
+    !besttimes        - Analyze last 30 days
+    !besttimes 60     - Analyze last 60 days  
+    !besttimes 90     - Analyze last 90 days
+    """
+    try:
+        if days < 7 or days > 365:
+            await ctx.send("❌ Days must be between 7 and 365")
+            return
+            
+        embed = discord.Embed(
+            title=f"🕐 ML-Powered Best Signal Times ({days}-day analysis)",
+            description="Discover optimal times for highest signal success rates",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            from advanced_analytics import advanced_analytics
+            
+            timing_analysis = await advanced_analytics.analyze_optimal_timing(days)
+            
+            if "error" in timing_analysis:
+                embed.add_field(
+                    name="❌ Analysis Error",
+                    value=timing_analysis["error"],
+                    inline=False
+                )
+                embed.color = 0xff6600
+            else:
+                # Best Hours
+                best_hours = timing_analysis.get("best_hours", {})
+                if best_hours:
+                    hours_text = ""
+                    for hour, data in list(best_hours.items())[:5]:
+                        success_rate = data['success_rate'] * 100
+                        signal_count = data['signal_count']
+                        emoji = "🔥" if success_rate >= 60 else "⭐" if success_rate >= 50 else "💡"
+                        
+                        # Convert to 12-hour format
+                        hour_12 = int(hour)
+                        am_pm = "AM" if hour_12 < 12 else "PM"
+                        if hour_12 == 0:
+                            hour_12 = 12
+                        elif hour_12 > 12:
+                            hour_12 -= 12
+                            
+                        hours_text += f"{emoji} **{hour_12}:00 {am_pm}:** {success_rate:.1f}% success ({signal_count} signals)\n"
+                    
+                    embed.add_field(
+                        name="⏰ Best Hours for Signals",
+                        value=hours_text,
+                        inline=False
+                    )
+                
+                # Best Days of Week
+                best_days = timing_analysis.get("best_days", {})
+                if best_days:
+                    days_text = ""
+                    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    
+                    for day_num, data in best_days.items():
+                        success_rate = data['success_rate'] * 100
+                        signal_count = data['signal_count']
+                        day_name = day_names[int(day_num)] if int(day_num) < len(day_names) else f"Day {day_num}"
+                        
+                        emoji = "🔥" if success_rate >= 60 else "⭐" if success_rate >= 50 else "💡"
+                        days_text += f"{emoji} **{day_name}:** {success_rate:.1f}% success ({signal_count} signals)\n"
+                    
+                    embed.add_field(
+                        name="📅 Best Days of Week",
+                        value=days_text,
+                        inline=True
+                    )
+                
+                # Peak Performance Combinations
+                peak_combos = timing_analysis.get("peak_combinations", [])
+                if peak_combos:
+                    combo_text = ""
+                    for combo in peak_combos[:3]:
+                        day_name = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][combo['day']]
+                        hour_12 = combo['hour'] if combo['hour'] <= 12 else combo['hour'] - 12
+                        hour_12 = 12 if hour_12 == 0 else hour_12
+                        am_pm = "AM" if combo['hour'] < 12 else "PM"
+                        
+                        combo_text += f"🎯 **{day_name} {hour_12}:00 {am_pm}:** {combo['success_rate']*100:.1f}% success\n"
+                    
+                    embed.add_field(
+                        name="🎯 Peak Performance Times",
+                        value=combo_text,
+                        inline=True
+                    )
+                
+                # Market Insights
+                insights = timing_analysis.get("insights", {})
+                if insights:
+                    insights_text = ""
+                    
+                    if insights.get('best_hour_overall'):
+                        best_hour = insights['best_hour_overall']
+                        hour_12 = best_hour if best_hour <= 12 else best_hour - 12
+                        hour_12 = 12 if hour_12 == 0 else hour_12
+                        am_pm = "AM" if best_hour < 12 else "PM"
+                        insights_text += f"⭐ **Golden Hour:** {hour_12}:00 {am_pm}\n"
+                    
+                    if insights.get('worst_hour_overall'):
+                        worst_hour = insights['worst_hour_overall']
+                        hour_12 = worst_hour if worst_hour <= 12 else worst_hour - 12
+                        hour_12 = 12 if hour_12 == 0 else hour_12
+                        am_pm = "AM" if worst_hour < 12 else "PM"
+                        insights_text += f"⚠️ **Avoid Hour:** {hour_12}:00 {am_pm}\n"
+                    
+                    if insights.get('weekend_vs_weekday'):
+                        weekend_better = insights['weekend_vs_weekday']
+                        insights_text += f"📊 **{'Weekend' if weekend_better else 'Weekday'} signals perform better**\n"
+                    
+                    if insights_text:
+                        embed.add_field(
+                            name="💡 Key Insights",
+                            value=insights_text,
+                            inline=False
+                        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error analyzing optimal times: {e}")
+
+@bot.command(name='signalquality')
+async def signal_quality_analysis(ctx, ticker: str = "AAPL", limit: int = 5):
+    """🏆 Analyze signal quality using ML scoring system
+    
+    Usage:
+    !signalquality AAPL     - Quality scores for AAPL (last 5 signals)
+    !signalquality BTC 10   - Quality scores for BTC (last 10 signals)
+    """
+    try:
+        if limit < 1 or limit > 20:
+            await ctx.send("❌ Limit must be between 1 and 20")
+            return
+            
+        embed = discord.Embed(
+            title=f"🏆 Signal Quality Analysis: {ticker.upper()}",
+            description=f"ML-powered quality scoring for last {limit} signals",
+            color=0x00ff88,
+            timestamp=datetime.now(EST)
+        )
+        
+        # Send typing indicator
+        async with ctx.typing():
+            from advanced_analytics import advanced_analytics
+            
+            # Get recent signals for this ticker from the database
+            conn = await init_database_connection()
+            if not conn:
+                await ctx.send("❌ Database connection failed")
+                return
+            
+            recent_signals = await conn.fetch('''
+                SELECT DISTINCT
+                    ticker,
+                    timeframe,
+                    signal_type,
+                    signal_date,
+                    strength,
+                    system
+                FROM signal_performance sp
+                WHERE ticker = $1
+                  AND signal_date >= NOW() - INTERVAL '30 days'
+                ORDER BY signal_date DESC
+                LIMIT $2
+            ''', ticker.upper(), limit)
+            
+            await conn.close()
+            
+            if not recent_signals:
+                embed.add_field(
+                    name="❌ No Recent Signals",
+                    value=f"No signals found for {ticker.upper()} in the last 30 days",
+                    inline=False
+                )
+                embed.color = 0xff6600
+            else:
+                quality_results = []
+                
+                for signal in recent_signals:
+                    signal_features = {
+                        'ticker': signal['ticker'],
+                        'timeframe': signal['timeframe'],
+                        'signal_type': signal['signal_type'],
+                        'strength': signal['strength'],
+                        'system': signal['system'],
+                        'signal_date': str(signal['signal_date'])
+                    }
+                    
+                    quality_result = await advanced_analytics.calculate_signal_quality_score(signal_features)
+                    
+                    if "error" not in quality_result:
+                        quality_results.append({
+                            'signal': signal,
+                            'quality': quality_result
+                        })
+                
+                if quality_results:
+                    # Sort by quality score (highest first)
+                    quality_results.sort(key=lambda x: x['quality']['quality_score'], reverse=True)
+                    
+                    # Display top signals
+                    signals_text = ""
+                    for i, result in enumerate(quality_results[:limit]):
+                        signal = result['signal']
+                        quality = result['quality']
+                        
+                        # Format signal date
+                        signal_date = signal['signal_date'].strftime('%m/%d %H:%M')
+                        
+                        signals_text += f"{quality['grade_emoji']} **{quality['grade']} ({quality['quality_score']})** - "
+                        signals_text += f"{signal['signal_type']} ({signal['timeframe']}) - {signal_date}\n"
+                        signals_text += f"   *{quality['recommendation']}*\n\n"
+                    
+                    embed.add_field(
+                        name="📊 Recent Signal Grades",
+                        value=signals_text,
+                        inline=False
+                    )
+                    
+                    # Quality distribution
+                    grades = [r['quality']['grade'] for r in quality_results]
+                    grade_counts = {}
+                    for grade in grades:
+                        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+                    
+                    distribution_text = ""
+                    for grade, count in sorted(grade_counts.items(), reverse=True):
+                        distribution_text += f"**{grade}:** {count} signals\n"
+                    
+                    embed.add_field(
+                        name="📈 Quality Distribution",
+                        value=distribution_text,
+                        inline=True
+                    )
+                    
+                    # Average quality score
+                    avg_score = sum(r['quality']['quality_score'] for r in quality_results) / len(quality_results)
+                    if avg_score >= 75:
+                        avg_emoji = "🔥"
+                    elif avg_score >= 65:
+                        avg_emoji = "⭐"
+                    elif avg_score >= 55:
+                        avg_emoji = "👍"
+                    else:
+                        avg_emoji = "⚠️"
+                    
+                    embed.add_field(
+                        name="📊 Average Quality",
+                        value=f"{avg_emoji} **{avg_score:.1f}/100**",
+                        inline=True
+                    )
+                    
+                else:
+                    embed.add_field(
+                        name="❌ Analysis Error",
+                        value="Could not analyze signal quality",
+                        inline=False
+                    )
+                    embed.color = 0xff6600
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error analyzing signal quality: {e}")
 
 if __name__ == "__main__":
     import asyncio

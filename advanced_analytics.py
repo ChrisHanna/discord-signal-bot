@@ -12,6 +12,8 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from scipy import stats
+from scipy.stats import chi2_contingency, pearsonr
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -24,12 +26,12 @@ class AdvancedAnalytics:
         self.ml_models = {}
         
     async def get_correlation_analysis(self, days: int = 30) -> Dict:
-        """Analyze correlations between different signals and their success rates"""
+        """Enhanced correlations with advanced pattern analysis"""
         try:
             conn = await asyncpg.connect(self.db_url)
             since_date = datetime.now() - timedelta(days=days)
             
-            # Get comprehensive signal data
+            # Get comprehensive signal data with enhanced fields
             signals_data = await conn.fetch('''
                 SELECT 
                     sp.ticker,
@@ -38,8 +40,11 @@ class AdvancedAnalytics:
                     sp.signal_date,
                     sp.price_at_signal,
                     sp.price_after_1h,
+                    sp.price_after_3h,
                     sp.price_after_6h,
                     sp.price_after_1d,
+                    sp.strength,
+                    sp.system,
                     CASE 
                         WHEN sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%' THEN 'BULLISH'
                         WHEN sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%' THEN 'BEARISH'
@@ -59,14 +64,25 @@ class AdvancedAnalytics:
                              AND sp.price_after_6h < sp.price_at_signal THEN 1
                         ELSE 0
                     END as success_6h,
+                    CASE 
+                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
+                             AND sp.price_after_1h > sp.price_at_signal THEN 1
+                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
+                             AND sp.price_after_1h < sp.price_at_signal THEN 1
+                        ELSE 0
+                    END as success_1h,
                     EXTRACT(hour FROM sp.signal_date) as signal_hour,
                     EXTRACT(dow FROM sp.signal_date) as signal_dow,
-                    (sp.price_after_1d - sp.price_at_signal) / sp.price_at_signal * 100 as return_1d
+                    ABS((sp.price_after_1d - sp.price_at_signal) / sp.price_at_signal * 100) as volatility_1d,
+                    (sp.price_after_1d - sp.price_at_signal) / sp.price_at_signal * 100 as return_1d,
+                    (sp.price_after_6h - sp.price_at_signal) / sp.price_at_signal * 100 as return_6h,
+                    (sp.price_after_1h - sp.price_at_signal) / sp.price_at_signal * 100 as return_1h
                 FROM signal_performance sp
                 WHERE sp.performance_date >= $1
                   AND sp.price_at_signal IS NOT NULL 
                   AND sp.price_after_1d IS NOT NULL
                   AND sp.price_after_6h IS NOT NULL
+                  AND sp.price_after_1h IS NOT NULL
                 ORDER BY sp.signal_date DESC
             ''', since_date)
             
@@ -78,25 +94,34 @@ class AdvancedAnalytics:
             # Convert to DataFrame for analysis
             df = pd.DataFrame([dict(row) for row in signals_data])
             
-            # Analyze signal combination patterns
+            # Enhanced analysis modules
             correlation_results = await self.analyze_signal_combinations(df)
-            
-            # Analyze temporal patterns
             temporal_patterns = await self.analyze_temporal_patterns(df)
-            
-            # Analyze ticker relationships
             ticker_correlations = await self.analyze_ticker_correlations(df)
+            
+            # NEW: Advanced correlation features
+            strength_analysis = await self.analyze_strength_correlations(df)
+            market_condition_analysis = await self.analyze_market_conditions(df)
+            volatility_patterns = await self.analyze_volatility_patterns(df)
+            system_performance = await self.analyze_system_correlations(df)
+            statistical_significance = await self.analyze_statistical_significance(df)
             
             return {
                 "signal_combinations": correlation_results,
                 "temporal_patterns": temporal_patterns,
                 "ticker_correlations": ticker_correlations,
+                "strength_analysis": strength_analysis,
+                "market_conditions": market_condition_analysis,
+                "volatility_patterns": volatility_patterns,
+                "system_performance": system_performance,
+                "statistical_significance": statistical_significance,
                 "total_signals_analyzed": len(df),
-                "analysis_period": f"{days} days"
+                "analysis_period": f"{days} days",
+                "data_quality_score": self.calculate_data_quality_score(df)
             }
             
         except Exception as e:
-            return {"error": f"Correlation analysis failed: {e}"}
+            return {"error": f"Enhanced correlation analysis failed: {e}"}
     
     async def analyze_signal_combinations(self, df: pd.DataFrame) -> Dict:
         """Find signals that tend to work well together"""
@@ -224,35 +249,273 @@ class AdvancedAnalytics:
         """Analyze relationships between ticker performance"""
         try:
             results = {
-                "ticker_success_correlation": {},
+                "ticker_success_correlation": [],
                 "cross_ticker_patterns": []
             }
             
-            # Calculate success rates by ticker
-            ticker_success = df.groupby('ticker').agg({
+            # Success rates by ticker
+            ticker_performance = df.groupby('ticker').agg({
                 'success_1d': ['mean', 'count'],
-                'return_1d': 'mean'
+                'return_1d': 'mean',
+                'volatility_1d': 'mean'
             }).round(3)
             
-            # Find tickers with significant data
-            significant_tickers = []
-            for ticker in ticker_success.index:
-                if ticker_success.loc[ticker, ('success_1d', 'count')] >= 10:
-                    significant_tickers.append({
+            ticker_success = []
+            for ticker in ticker_performance.index:
+                if ticker_performance.loc[ticker, ('success_1d', 'count')] >= 3:
+                    ticker_success.append({
                         "ticker": ticker,
-                        "success_rate": float(ticker_success.loc[ticker, ('success_1d', 'mean')] * 100),
-                        "avg_return": float(ticker_success.loc[ticker, ('return_1d', 'mean')]),
-                        "signal_count": int(ticker_success.loc[ticker, ('success_1d', 'count')])
+                        "success_rate": float(ticker_performance.loc[ticker, ('success_1d', 'mean')] * 100),
+                        "avg_return": float(ticker_performance.loc[ticker, ('return_1d', 'mean')]),
+                        "avg_volatility": float(ticker_performance.loc[ticker, ('volatility_1d', 'mean')]),
+                        "signal_count": int(ticker_performance.loc[ticker, ('success_1d', 'count')])
                     })
             
-            results["ticker_success_correlation"] = sorted(
-                significant_tickers, key=lambda x: x["success_rate"], reverse=True
-            )
+            results["ticker_success_correlation"] = sorted(ticker_success, key=lambda x: x["success_rate"], reverse=True)
             
             return results
             
         except Exception as e:
             return {"error": f"Ticker correlation analysis failed: {e}"}
+    
+    async def analyze_strength_correlations(self, df: pd.DataFrame) -> Dict:
+        """Analyze signal strength correlations with success rates"""
+        try:
+            results = {
+                "strength_correlation": {},
+                "optimal_strength_ranges": []
+            }
+            
+            # Only analyze if strength data is available
+            if 'strength' in df.columns and df['strength'].notna().sum() > 10:
+                # Calculate correlation between strength and success
+                strength_corr = df[['strength', 'success_1d']].corr().iloc[0, 1]
+                results["strength_correlation"] = {
+                    "correlation_coefficient": float(strength_corr) if not pd.isna(strength_corr) else 0,
+                    "significance": "High" if abs(strength_corr) > 0.3 else "Medium" if abs(strength_corr) > 0.1 else "Low"
+                }
+                
+                # Find optimal strength ranges
+                df['strength_range'] = pd.cut(df['strength'], bins=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'])
+                strength_analysis = df.groupby('strength_range').agg({
+                    'success_1d': ['mean', 'count'],
+                    'return_1d': 'mean'
+                }).round(3)
+                
+                for strength_range in strength_analysis.index:
+                    if strength_analysis.loc[strength_range, ('success_1d', 'count')] >= 3:
+                        results["optimal_strength_ranges"].append({
+                            "range": str(strength_range),
+                            "success_rate": float(strength_analysis.loc[strength_range, ('success_1d', 'mean')] * 100),
+                            "avg_return": float(strength_analysis.loc[strength_range, ('return_1d', 'mean')]),
+                            "count": int(strength_analysis.loc[strength_range, ('success_1d', 'count')])
+                        })
+                
+                results["optimal_strength_ranges"].sort(key=lambda x: x["success_rate"], reverse=True)
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"Strength correlation analysis failed: {e}"}
+    
+    async def analyze_market_conditions(self, df: pd.DataFrame) -> Dict:
+        """Analyze performance under different market conditions"""
+        try:
+            results = {
+                "volatility_performance": [],
+                "market_regime_analysis": {}
+            }
+            
+            # Volatility-based performance analysis
+            df['volatility_category'] = pd.cut(df['volatility_1d'], 
+                                               bins=[0, 2, 5, float('inf')], 
+                                               labels=['Low', 'Medium', 'High'])
+            
+            vol_analysis = df.groupby('volatility_category').agg({
+                'success_1d': ['mean', 'count'],
+                'return_1d': 'mean'
+            }).round(3)
+            
+            for vol_cat in vol_analysis.index:
+                if vol_analysis.loc[vol_cat, ('success_1d', 'count')] >= 3:
+                    results["volatility_performance"].append({
+                        "category": str(vol_cat),
+                        "success_rate": float(vol_analysis.loc[vol_cat, ('success_1d', 'mean')] * 100),
+                        "avg_return": float(vol_analysis.loc[vol_cat, ('return_1d', 'mean')]),
+                        "signal_count": int(vol_analysis.loc[vol_cat, ('success_1d', 'count')])
+                    })
+            
+            results["volatility_performance"].sort(key=lambda x: x["success_rate"], reverse=True)
+            
+            # Market regime analysis based on overall returns
+            avg_return = df['return_1d'].mean()
+            market_regime = "Bullish" if avg_return > 1 else "Bearish" if avg_return < -1 else "Neutral"
+            
+            results["market_regime_analysis"] = {
+                "current_regime": market_regime,
+                "avg_market_return": float(avg_return),
+                "signal_performance_in_regime": float(df['success_1d'].mean() * 100)
+            }
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"Market conditions analysis failed: {e}"}
+    
+    async def analyze_volatility_patterns(self, df: pd.DataFrame) -> Dict:
+        """Analyze volatility patterns and trends"""
+        try:
+            results = {
+                "trend": "Neutral",
+                "volatility_distribution": {},
+                "volatility_success_correlation": 0
+            }
+            
+            # Calculate volatility trend
+            df_sorted = df.sort_values('signal_date')
+            if len(df_sorted) > 10:
+                early_vol = df_sorted.head(len(df_sorted)//2)['volatility_1d'].mean()
+                late_vol = df_sorted.tail(len(df_sorted)//2)['volatility_1d'].mean()
+                
+                if late_vol > early_vol * 1.1:
+                    results["trend"] = "Increasing"
+                elif late_vol < early_vol * 0.9:
+                    results["trend"] = "Decreasing"
+                else:
+                    results["trend"] = "Stable"
+            
+            # Volatility-success correlation
+            vol_success_corr = df[['volatility_1d', 'success_1d']].corr().iloc[0, 1]
+            results["volatility_success_correlation"] = float(vol_success_corr) if not pd.isna(vol_success_corr) else 0
+            
+            # Distribution analysis
+            results["volatility_distribution"] = {
+                "mean": float(df['volatility_1d'].mean()),
+                "median": float(df['volatility_1d'].median()),
+                "std": float(df['volatility_1d'].std())
+            }
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"Volatility patterns analysis failed: {e}"}
+    
+    async def analyze_system_correlations(self, df: pd.DataFrame) -> Dict:
+        """Analyze performance by signal system/source"""
+        try:
+            results = {
+                "system_rankings": [],
+                "system_correlations": {}
+            }
+            
+            # Only analyze if system data is available
+            if 'system' in df.columns and df['system'].notna().sum() > 5:
+                system_performance = df.groupby('system').agg({
+                    'success_1d': ['mean', 'count'],
+                    'return_1d': 'mean'
+                }).round(3)
+                
+                system_rankings = []
+                for system in system_performance.index:
+                    if system_performance.loc[system, ('success_1d', 'count')] >= 3:
+                        system_rankings.append({
+                            "system": str(system),
+                            "success_rate": float(system_performance.loc[system, ('success_1d', 'mean')] * 100),
+                            "avg_return": float(system_performance.loc[system, ('return_1d', 'mean')]),
+                            "signal_count": int(system_performance.loc[system, ('success_1d', 'count')])
+                        })
+                
+                # Rank systems by success rate
+                system_rankings.sort(key=lambda x: x["success_rate"], reverse=True)
+                for i, system in enumerate(system_rankings):
+                    system["rank"] = i + 1
+                
+                results["system_rankings"] = system_rankings
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"System correlation analysis failed: {e}"}
+    
+    async def analyze_statistical_significance(self, df: pd.DataFrame) -> Dict:
+        """Analyze statistical significance of patterns"""
+        try:
+            results = {
+                "overall_confidence": "Medium",
+                "sample_size_adequacy": {},
+                "pattern_significance": {}
+            }
+            
+            # Sample size analysis
+            total_signals = len(df)
+            if total_signals >= 100:
+                results["overall_confidence"] = "High"
+            elif total_signals >= 50:
+                results["overall_confidence"] = "Medium"
+            else:
+                results["overall_confidence"] = "Low"
+            
+            results["sample_size_adequacy"] = {
+                "total_signals": total_signals,
+                "confidence_threshold": "100+ signals for high confidence",
+                "current_level": results["overall_confidence"]
+            }
+            
+            # Chi-square test for signal type vs success
+            if len(df) > 20:
+                try:
+                    contingency_table = pd.crosstab(df['signal_type'], df['success_1d'])
+                    if contingency_table.shape[0] > 1 and contingency_table.shape[1] > 1:
+                        chi2, p_value, dof, expected = chi2_contingency(contingency_table)
+                        results["pattern_significance"] = {
+                            "signal_type_significance": "Significant" if p_value < 0.05 else "Not Significant",
+                            "p_value": float(p_value),
+                            "chi2_statistic": float(chi2)
+                        }
+                except Exception:
+                    pass
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"Statistical significance analysis failed: {e}"}
+    
+    def calculate_data_quality_score(self, df: pd.DataFrame) -> float:
+        """Calculate a data quality score based on completeness and reliability"""
+        try:
+            # Key field completeness
+            key_fields = ['price_at_signal', 'price_after_1h', 'price_after_6h', 'price_after_1d', 
+                         'success_1h', 'success_6h', 'success_1d']
+            
+            completeness_scores = []
+            for field in key_fields:
+                if field in df.columns:
+                    completeness = df[field].notna().sum() / len(df)
+                    completeness_scores.append(completeness)
+                else:
+                    completeness_scores.append(0)
+            
+            # Overall completeness
+            avg_completeness = np.mean(completeness_scores)
+            
+            # Sample size factor
+            sample_size_factor = min(1.0, len(df) / 100)  # Optimal at 100+ signals
+            
+            # Recency factor (more recent data is better)
+            if 'signal_date' in df.columns:
+                latest_signal = df['signal_date'].max()
+                days_since_latest = (datetime.now() - latest_signal).days
+                recency_factor = max(0.5, 1 - (days_since_latest / 30))  # Decay over 30 days
+            else:
+                recency_factor = 0.8
+            
+            # Combined quality score
+            quality_score = (avg_completeness * 0.5 + sample_size_factor * 0.3 + recency_factor * 0.2)
+            
+            return min(1.0, quality_score)
+            
+        except Exception:
+            return 0.5  # Default medium quality
     
     async def get_ml_predictions(self, days: int = 90) -> Dict:
         """Use machine learning to predict signal success probability"""
@@ -271,6 +534,8 @@ class AdvancedAnalytics:
                     sp.price_after_1h,
                     sp.price_after_6h,
                     sp.price_after_1d,
+                    sp.strength,
+                    sp.system,
                     EXTRACT(hour FROM sp.signal_date) as signal_hour,
                     EXTRACT(dow FROM sp.signal_date) as signal_dow,
                     EXTRACT(day FROM sp.signal_date) as signal_day,
@@ -324,10 +589,18 @@ class AdvancedAnalytics:
             df_encoded['timeframe_encoded'] = le_timeframe.fit_transform(df['timeframe'])
             df_encoded['signal_type_encoded'] = le_signal_type.fit_transform(df['signal_type'])
             
-            # Create feature matrix
+            # Handle missing strength/system data
+            df_encoded['strength'] = df_encoded['strength'].fillna(df_encoded['strength'].median())
+            df_encoded['system_encoded'] = 0  # Default for missing system data
+            if 'system' in df_encoded.columns and not df_encoded['system'].isna().all():
+                le_system = LabelEncoder()
+                df_encoded['system_encoded'] = le_system.fit_transform(df_encoded['system'].fillna('unknown'))
+            
+            # Create enhanced feature matrix
             features = [
                 'ticker_encoded', 'timeframe_encoded', 'signal_type_encoded',
-                'signal_hour', 'signal_dow', 'signal_day', 'signal_direction_encoded'
+                'signal_hour', 'signal_dow', 'signal_day', 'signal_direction_encoded',
+                'strength', 'system_encoded'
             ]
             
             X = df_encoded[features]
@@ -435,6 +708,313 @@ class AdvancedAnalytics:
             
         except Exception as e:
             return {"error": f"Recent predictions failed: {e}"}
+    
+    async def predict_single_signal(self, signal_features: Dict) -> Dict:
+        """Predict success probability for a single signal in real-time"""
+        try:
+            # Quick feature engineering for real-time prediction
+            from datetime import datetime, timedelta
+            import pandas as pd
+            
+            conn = await asyncpg.connect(self.db_url)
+            
+            # Get recent historical data for this ticker/timeframe (last 30 days for speed)
+            recent_data = await conn.fetch('''
+                SELECT 
+                    sp.ticker,
+                    sp.timeframe,
+                    sp.signal_type,
+                    sp.strength,
+                    sp.system,
+                    CASE 
+                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
+                             AND sp.price_after_1d > sp.price_at_signal THEN 1
+                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
+                             AND sp.price_after_1d < sp.price_at_signal THEN 1
+                        ELSE 0
+                    END as success_1d,
+                    EXTRACT(hour FROM sp.signal_date) as signal_hour,
+                    EXTRACT(dow FROM sp.signal_date) as signal_dow
+                FROM signal_performance sp
+                WHERE sp.performance_date >= $1
+                  AND sp.price_at_signal IS NOT NULL 
+                  AND sp.price_after_1d IS NOT NULL
+                ORDER BY sp.signal_date DESC
+                LIMIT 500
+            ''', datetime.now() - timedelta(days=30))
+            
+            await conn.close()
+            
+            if len(recent_data) < 20:
+                return {"error": "Insufficient recent data for prediction"}
+            
+            # Convert to DataFrame
+            df = pd.DataFrame([dict(row) for row in recent_data])
+            
+            # Quick success rate calculation for this specific signal type
+            similar_signals = df[
+                (df['ticker'] == signal_features['ticker']) & 
+                (df['timeframe'] == signal_features['timeframe']) &
+                (df['signal_type'] == signal_features['signal_type'])
+            ]
+            
+            # Fallback to broader categories if not enough specific data
+            if len(similar_signals) < 5:
+                similar_signals = df[
+                    (df['ticker'] == signal_features['ticker']) & 
+                    (df['timeframe'] == signal_features['timeframe'])
+                ]
+            
+            if len(similar_signals) < 5:
+                similar_signals = df[df['signal_type'] == signal_features['signal_type']]
+            
+            if len(similar_signals) < 5:
+                similar_signals = df  # Use all data as last resort
+            
+            # Calculate success probability
+            success_rate = similar_signals['success_1d'].mean()
+            
+            # Adjust based on signal strength
+            strength_multiplier = {
+                'Very Strong': 1.2,
+                'Strong': 1.1,
+                'Moderate': 1.0,
+                'Weak': 0.8,
+                'Unknown': 0.9
+            }.get(signal_features.get('strength', 'Unknown'), 0.9)
+            
+            adjusted_success_rate = min(success_rate * strength_multiplier, 0.95)  # Cap at 95%
+            
+            # Determine confidence level based on sample size and consistency
+            sample_size = len(similar_signals)
+            if sample_size >= 50:
+                confidence = "high"
+            elif sample_size >= 20:
+                confidence = "medium"
+            else:
+                confidence = "low"
+            
+            # Determine risk level
+            if adjusted_success_rate >= 0.7:
+                risk_level = "low"
+            elif adjusted_success_rate >= 0.5:
+                risk_level = "medium"
+            else:
+                risk_level = "high"
+            
+            # Get current market hour for timing analysis
+            current_hour = datetime.now().hour
+            good_hours = [9, 10, 14, 15]  # Market open and close hours
+            timing_bonus = 1.05 if current_hour in good_hours else 1.0
+            
+            final_probability = min(adjusted_success_rate * timing_bonus, 0.95)
+            
+            return {
+                "prediction": {
+                    "success_probability": float(final_probability),
+                    "confidence": confidence,
+                    "risk_level": risk_level,
+                    "sample_size": sample_size,
+                    "base_success_rate": float(success_rate),
+                    "strength_adjustment": strength_multiplier,
+                    "timing_bonus": timing_bonus
+                }
+            }
+            
+        except Exception as e:
+            return {"error": f"Single signal prediction failed: {e}"}
+    
+    async def analyze_optimal_timing(self, days: int = 30) -> Dict:
+        """Analyze optimal timing for signals based on success rates"""
+        try:
+            conn = await asyncpg.connect(self.db_url)
+            since_date = datetime.now() - timedelta(days=days)
+            
+            # Get timing data for signals
+            timing_data = await conn.fetch('''
+                SELECT 
+                    EXTRACT(hour FROM sp.signal_date) as signal_hour,
+                    EXTRACT(dow FROM sp.signal_date) as signal_dow,
+                    CASE 
+                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
+                             AND sp.price_after_1d > sp.price_at_signal THEN 1
+                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
+                             AND sp.price_after_1d < sp.price_at_signal THEN 1
+                        ELSE 0
+                    END as success_1d,
+                    sp.ticker,
+                    sp.signal_type
+                FROM signal_performance sp
+                WHERE sp.performance_date >= $1
+                  AND sp.price_at_signal IS NOT NULL 
+                  AND sp.price_after_1d IS NOT NULL
+                ORDER BY sp.signal_date DESC
+            ''', since_date)
+            
+            await conn.close()
+            
+            if len(timing_data) < 10:
+                return {"error": "Insufficient data for timing analysis"}
+            
+            # Convert to DataFrame
+            df = pd.DataFrame([dict(row) for row in timing_data])
+            
+            # Analyze by hour
+            hourly_stats = df.groupby('signal_hour').agg({
+                'success_1d': ['mean', 'count']
+            }).round(4)
+            hourly_stats.columns = ['success_rate', 'signal_count']
+            
+            # Filter hours with at least 3 signals
+            hourly_stats = hourly_stats[hourly_stats['signal_count'] >= 3]
+            best_hours = hourly_stats.sort_values('success_rate', ascending=False).head(5)
+            
+            # Analyze by day of week
+            daily_stats = df.groupby('signal_dow').agg({
+                'success_1d': ['mean', 'count']
+            }).round(4)
+            daily_stats.columns = ['success_rate', 'signal_count']
+            
+            # Filter days with at least 3 signals
+            daily_stats = daily_stats[daily_stats['signal_count'] >= 3]
+            best_days = daily_stats.sort_values('success_rate', ascending=False)
+            
+            # Find peak combination times
+            combo_stats = df.groupby(['signal_dow', 'signal_hour']).agg({
+                'success_1d': ['mean', 'count']
+            }).round(4)
+            combo_stats.columns = ['success_rate', 'signal_count']
+            
+            # Filter combinations with at least 2 signals
+            combo_stats = combo_stats[combo_stats['signal_count'] >= 2]
+            peak_combinations = combo_stats.sort_values('success_rate', ascending=False).head(5)
+            
+            # Generate insights
+            insights = {}
+            
+            if not hourly_stats.empty:
+                insights['best_hour_overall'] = int(hourly_stats.index[0])
+                insights['worst_hour_overall'] = int(hourly_stats.sort_values('success_rate').index[0])
+            
+            if not daily_stats.empty:
+                # Weekend vs weekday analysis
+                weekend_success = df[df['signal_dow'].isin([0, 6])]['success_1d'].mean()  # Sunday=0, Saturday=6
+                weekday_success = df[~df['signal_dow'].isin([0, 6])]['success_1d'].mean()
+                insights['weekend_vs_weekday'] = weekend_success > weekday_success
+            
+            return {
+                "best_hours": {
+                    str(int(hour)): {
+                        'success_rate': float(data['success_rate']),
+                        'signal_count': int(data['signal_count'])
+                    }
+                    for hour, data in best_hours.iterrows()
+                },
+                "best_days": {
+                    str(int(day)): {
+                        'success_rate': float(data['success_rate']),
+                        'signal_count': int(data['signal_count'])
+                    }
+                    for day, data in best_days.iterrows()
+                },
+                "peak_combinations": [
+                    {
+                        'day': int(combo[0]),
+                        'hour': int(combo[1]),
+                        'success_rate': float(data['success_rate']),
+                        'signal_count': int(data['signal_count'])
+                    }
+                    for combo, data in peak_combinations.iterrows()
+                ],
+                "insights": insights,
+                "total_signals_analyzed": len(df)
+            }
+            
+        except Exception as e:
+            return {"error": f"Timing analysis failed: {e}"}
+
+    async def calculate_signal_quality_score(self, signal_features: Dict) -> Dict:
+        """Calculate comprehensive quality score for a signal using multiple ML factors"""
+        try:
+            # Get basic ML prediction
+            ml_result = await self.predict_single_signal(signal_features)
+            if "error" in ml_result:
+                return ml_result
+            
+            prediction = ml_result['prediction']
+            
+            # Quality factors with weights
+            factors = {
+                'success_probability': prediction['success_probability'],
+                'confidence_level': {
+                    'high': 0.9,
+                    'medium': 0.7,
+                    'low': 0.4
+                }.get(prediction.get('confidence', 'medium'), 0.7),
+                'risk_level': {
+                    'low': 0.9,
+                    'medium': 0.6,
+                    'high': 0.2
+                }.get(prediction.get('risk_level', 'medium'), 0.6),
+                'sample_size_factor': min(prediction.get('sample_size', 20) / 50, 1.0),  # Cap at 1.0
+                'timing_bonus': prediction.get('timing_bonus', 1.0)
+            }
+            
+            # Calculate weighted quality score (0-100)
+            weights = {
+                'success_probability': 0.4,  # 40% weight
+                'confidence_level': 0.25,    # 25% weight
+                'risk_level': 0.2,           # 20% weight
+                'sample_size_factor': 0.1,   # 10% weight
+                'timing_bonus': 0.05         # 5% weight
+            }
+            
+            quality_score = sum(
+                factors[factor] * weight 
+                for factor, weight in weights.items()
+            ) * 100
+            
+            # Quality grade
+            if quality_score >= 85:
+                grade = "A+"
+                grade_emoji = "🏆"
+                recommendation = "EXCELLENT - High priority signal"
+            elif quality_score >= 75:
+                grade = "A"
+                grade_emoji = "🔥"
+                recommendation = "VERY GOOD - Send immediately"
+            elif quality_score >= 65:
+                grade = "B+"
+                grade_emoji = "⭐"
+                recommendation = "GOOD - Consider sending"
+            elif quality_score >= 55:
+                grade = "B"
+                grade_emoji = "👍"
+                recommendation = "AVERAGE - Monitor closely"
+            elif quality_score >= 45:
+                grade = "C+"
+                grade_emoji = "⚠️"
+                recommendation = "BELOW AVERAGE - Use caution"
+            elif quality_score >= 35:
+                grade = "C"
+                grade_emoji = "👎"
+                recommendation = "POOR - Avoid unless other factors"
+            else:
+                grade = "D"
+                grade_emoji = "🚫"
+                recommendation = "VERY POOR - Do not send"
+            
+            return {
+                "quality_score": round(quality_score, 1),
+                "grade": grade,
+                "grade_emoji": grade_emoji,
+                "recommendation": recommendation,
+                "factors": factors,
+                "prediction_details": prediction
+            }
+            
+        except Exception as e:
+            return {"error": f"Quality scoring failed: {e}"}
 
 # Global instance
 advanced_analytics = AdvancedAnalytics() 
