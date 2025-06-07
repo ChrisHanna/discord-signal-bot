@@ -6363,6 +6363,150 @@ async def signal_quality_analysis(ctx, ticker: str = "AAPL", limit: int = 5):
     except Exception as e:
         await ctx.send(f"❌ Error analyzing signal quality: {e}")
 
+@bot.command(name='datavalidation')
+async def data_validation_command(ctx, days: int = 30):
+    """Comprehensive data validation for ML commands - !datavalidation [days]"""
+    try:
+        # Validate days parameter
+        if not 7 <= days <= 90:
+            await ctx.send("❌ Days must be between 7 and 90")
+            return
+        
+        # Send typing indicator
+        async with ctx.typing():
+            # Import validation functions
+            from comprehensive_data_validator import validate_data
+            
+            # Run comprehensive validation
+            validation_results = await validate_data(days)
+            
+            if 'error' in validation_results:
+                await ctx.send(f"❌ Data validation failed: {validation_results['error']}")
+                return
+            
+            # Create embed
+            embed = discord.Embed(
+                title="🔍 Comprehensive Data Validation Report",
+                description=f"Data quality assessment for ML commands ({days} days analysis)",
+                color=0x00ff88 if validation_results.get('overall_score', 0) >= 0.7 else 0xff6b00 if validation_results.get('overall_score', 0) >= 0.5 else 0xff0000,
+                timestamp=datetime.now(EST)
+            )
+            
+            # Overall Score
+            overall_score = validation_results.get('overall_score', 0)
+            score_emoji = "🟢" if overall_score >= 0.8 else "🟡" if overall_score >= 0.6 else "🔴"
+            embed.add_field(
+                name="📊 Overall Data Quality Score",
+                value=f"{score_emoji} **{overall_score:.1%}** ({overall_score:.3f}/1.000)",
+                inline=False
+            )
+            
+            # Schema Validation
+            schema = validation_results.get('schema_validation', {})
+            schema_score = schema.get('schema_score', 0)
+            schema_emoji = "✅" if schema_score >= 0.9 else "⚠️" if schema_score >= 0.7 else "❌"
+            embed.add_field(
+                name="🗄️ Database Schema",
+                value=f"{schema_emoji} Score: {schema_score:.1%}\nTables: {len([t for t in schema.get('tables_exist', {}).values() if t])}/4 exist",
+                inline=True
+            )
+            
+            # Data Quality
+            quality = validation_results.get('data_quality', {})
+            quality_score = quality.get('quality_score', 0)
+            quality_emoji = "✅" if quality_score >= 0.8 else "⚠️" if quality_score >= 0.6 else "❌"
+            
+            # Get specific quality metrics
+            completeness = quality.get('completeness', {})
+            freshness = quality.get('freshness', {})
+            
+            embed.add_field(
+                name="🧹 Data Quality",
+                value=f"{quality_emoji} Score: {quality_score:.1%}\nCompleteness: {completeness.get('status', 'Unknown')}\nFreshness: {freshness.get('status', 'Unknown')}",
+                inline=True
+            )
+            
+            # ML Readiness
+            ml_readiness = validation_results.get('ml_readiness', {})
+            ml_score = ml_readiness.get('ml_score', 0)
+            ml_emoji = "🤖" if ml_score >= 0.8 else "⚙️" if ml_score >= 0.6 else "🔧"
+            
+            sample_size = ml_readiness.get('sample_size', {})
+            
+            embed.add_field(
+                name="🤖 ML Readiness",
+                value=f"{ml_emoji} Score: {ml_score:.1%}\nSamples: {sample_size.get('total_samples', 0):,}\nStatus: {sample_size.get('status', 'Unknown')}",
+                inline=True
+            )
+            
+            # Key Statistics
+            if completeness.get('total_records', 0) > 0:
+                embed.add_field(
+                    name="📈 Key Statistics",
+                    value=f"""
+**Total Records:** {completeness.get('total_records', 0):,}
+**Unique Tickers:** {sample_size.get('unique_tickers', 0)}
+**Unique Timeframes:** {sample_size.get('unique_timeframes', 0)}
+**Data Completeness:** {completeness.get('score', 0):.1%}
+                    """,
+                    inline=True
+                )
+            
+            # Freshness Details
+            if freshness.get('latest_performance_date'):
+                latest_date = freshness.get('latest_performance_date', '')
+                days_since = freshness.get('days_since_update', 0)
+                embed.add_field(
+                    name="🕐 Data Freshness",
+                    value=f"""
+**Latest Update:** {latest_date[:10]}
+**Days Since Update:** {days_since}
+**Recent Records (7d):** {freshness.get('recent_records_7d', 0):,}
+                    """,
+                    inline=True
+                )
+            
+            # Recommendations
+            recommendations = validation_results.get('recommendations', [])
+            if recommendations:
+                rec_text = "\n".join(f"• {rec}" for rec in recommendations[:3])  # Show top 3
+                if len(recommendations) > 3:
+                    rec_text += f"\n... and {len(recommendations) - 3} more"
+                
+                embed.add_field(
+                    name="💡 Recommendations",
+                    value=rec_text,
+                    inline=False
+                )
+            
+            # Status Indicators
+            status_indicators = []
+            if overall_score >= 0.8:
+                status_indicators.append("🟢 Ready for ML Analysis")
+            elif overall_score >= 0.6:
+                status_indicators.append("🟡 Needs Minor Improvements")
+            else:
+                status_indicators.append("🔴 Requires Data Fixes")
+            
+            if schema_score >= 0.9:
+                status_indicators.append("✅ Schema Valid")
+            
+            if quality_score >= 0.8:
+                status_indicators.append("🧹 Quality Excellent")
+            
+            embed.add_field(
+                name="🎯 Status",
+                value=" | ".join(status_indicators),
+                inline=False
+            )
+            
+            embed.set_footer(text="🔬 Enhanced with comprehensive validation & ML readiness assessment | Use !correlations, !mlpredict, !successrates for analysis")
+            
+            await ctx.send(embed=embed)
+    
+    except Exception as e:
+        await ctx.send(f"❌ Error running data validation: {e}")
+
 if __name__ == "__main__":
     import asyncio
     import sys

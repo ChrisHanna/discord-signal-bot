@@ -31,7 +31,7 @@ class AdvancedAnalytics:
             conn = await asyncpg.connect(self.db_url)
             since_date = datetime.now() - timedelta(days=days)
             
-            # Get comprehensive signal data with enhanced fields
+            # Get comprehensive signal data with enhanced fields (removed non-existent columns)
             signals_data = await conn.fetch('''
                 SELECT 
                     sp.ticker,
@@ -40,48 +40,29 @@ class AdvancedAnalytics:
                     sp.signal_date,
                     sp.price_at_signal,
                     sp.price_after_1h,
-                    sp.price_after_3h,
-                    sp.price_after_6h,
+                    sp.price_after_4h,
                     sp.price_after_1d,
-                    sp.strength,
-                    sp.system,
+                    sp.price_after_3d,
+                    sp.success_1h,
+                    sp.success_4h,
+                    sp.success_1d,
+                    sp.success_3d,
                     CASE 
                         WHEN sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%' THEN 'BULLISH'
                         WHEN sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%' THEN 'BEARISH'
                         ELSE 'NEUTRAL'
                     END as signal_direction,
-                    CASE 
-                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
-                             AND sp.price_after_1d > sp.price_at_signal THEN 1
-                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
-                             AND sp.price_after_1d < sp.price_at_signal THEN 1
-                        ELSE 0
-                    END as success_1d,
-                    CASE 
-                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
-                             AND sp.price_after_6h > sp.price_at_signal THEN 1
-                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
-                             AND sp.price_after_6h < sp.price_at_signal THEN 1
-                        ELSE 0
-                    END as success_6h,
-                    CASE 
-                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
-                             AND sp.price_after_1h > sp.price_at_signal THEN 1
-                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
-                             AND sp.price_after_1h < sp.price_at_signal THEN 1
-                        ELSE 0
-                    END as success_1h,
                     EXTRACT(hour FROM sp.signal_date) as signal_hour,
                     EXTRACT(dow FROM sp.signal_date) as signal_dow,
                     ABS((sp.price_after_1d - sp.price_at_signal) / sp.price_at_signal * 100) as volatility_1d,
                     (sp.price_after_1d - sp.price_at_signal) / sp.price_at_signal * 100 as return_1d,
-                    (sp.price_after_6h - sp.price_at_signal) / sp.price_at_signal * 100 as return_6h,
+                    (sp.price_after_4h - sp.price_at_signal) / sp.price_at_signal * 100 as return_4h,
                     (sp.price_after_1h - sp.price_at_signal) / sp.price_at_signal * 100 as return_1h
                 FROM signal_performance sp
                 WHERE sp.performance_date >= $1
                   AND sp.price_at_signal IS NOT NULL 
                   AND sp.price_after_1d IS NOT NULL
-                  AND sp.price_after_6h IS NOT NULL
+                  AND sp.price_after_4h IS NOT NULL
                   AND sp.price_after_1h IS NOT NULL
                 ORDER BY sp.signal_date DESC
             ''', since_date)
@@ -99,21 +80,17 @@ class AdvancedAnalytics:
             temporal_patterns = await self.analyze_temporal_patterns(df)
             ticker_correlations = await self.analyze_ticker_correlations(df)
             
-            # NEW: Advanced correlation features
-            strength_analysis = await self.analyze_strength_correlations(df)
+            # Advanced correlation features (adapted for available data)
             market_condition_analysis = await self.analyze_market_conditions(df)
             volatility_patterns = await self.analyze_volatility_patterns(df)
-            system_performance = await self.analyze_system_correlations(df)
             statistical_significance = await self.analyze_statistical_significance(df)
             
             return {
                 "signal_combinations": correlation_results,
                 "temporal_patterns": temporal_patterns,
                 "ticker_correlations": ticker_correlations,
-                "strength_analysis": strength_analysis,
                 "market_conditions": market_condition_analysis,
                 "volatility_patterns": volatility_patterns,
-                "system_performance": system_performance,
                 "statistical_significance": statistical_significance,
                 "total_signals_analyzed": len(df),
                 "analysis_period": f"{days} days",
@@ -139,7 +116,7 @@ class AdvancedAnalytics:
                 'signal_type': list,
                 'timeframe': list,
                 'success_1d': 'mean',
-                'success_6h': 'mean',
+                'success_1h': 'mean',
                 'return_1d': 'mean'
             }).reset_index()
             
@@ -278,46 +255,6 @@ class AdvancedAnalytics:
         except Exception as e:
             return {"error": f"Ticker correlation analysis failed: {e}"}
     
-    async def analyze_strength_correlations(self, df: pd.DataFrame) -> Dict:
-        """Analyze signal strength correlations with success rates"""
-        try:
-            results = {
-                "strength_correlation": {},
-                "optimal_strength_ranges": []
-            }
-            
-            # Only analyze if strength data is available
-            if 'strength' in df.columns and df['strength'].notna().sum() > 10:
-                # Calculate correlation between strength and success
-                strength_corr = df[['strength', 'success_1d']].corr().iloc[0, 1]
-                results["strength_correlation"] = {
-                    "correlation_coefficient": float(strength_corr) if not pd.isna(strength_corr) else 0,
-                    "significance": "High" if abs(strength_corr) > 0.3 else "Medium" if abs(strength_corr) > 0.1 else "Low"
-                }
-                
-                # Find optimal strength ranges
-                df['strength_range'] = pd.cut(df['strength'], bins=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'])
-                strength_analysis = df.groupby('strength_range').agg({
-                    'success_1d': ['mean', 'count'],
-                    'return_1d': 'mean'
-                }).round(3)
-                
-                for strength_range in strength_analysis.index:
-                    if strength_analysis.loc[strength_range, ('success_1d', 'count')] >= 3:
-                        results["optimal_strength_ranges"].append({
-                            "range": str(strength_range),
-                            "success_rate": float(strength_analysis.loc[strength_range, ('success_1d', 'mean')] * 100),
-                            "avg_return": float(strength_analysis.loc[strength_range, ('return_1d', 'mean')]),
-                            "count": int(strength_analysis.loc[strength_range, ('success_1d', 'count')])
-                        })
-                
-                results["optimal_strength_ranges"].sort(key=lambda x: x["success_rate"], reverse=True)
-            
-            return results
-            
-        except Exception as e:
-            return {"error": f"Strength correlation analysis failed: {e}"}
-    
     async def analyze_market_conditions(self, df: pd.DataFrame) -> Dict:
         """Analyze performance under different market conditions"""
         try:
@@ -400,43 +337,6 @@ class AdvancedAnalytics:
         except Exception as e:
             return {"error": f"Volatility patterns analysis failed: {e}"}
     
-    async def analyze_system_correlations(self, df: pd.DataFrame) -> Dict:
-        """Analyze performance by signal system/source"""
-        try:
-            results = {
-                "system_rankings": [],
-                "system_correlations": {}
-            }
-            
-            # Only analyze if system data is available
-            if 'system' in df.columns and df['system'].notna().sum() > 5:
-                system_performance = df.groupby('system').agg({
-                    'success_1d': ['mean', 'count'],
-                    'return_1d': 'mean'
-                }).round(3)
-                
-                system_rankings = []
-                for system in system_performance.index:
-                    if system_performance.loc[system, ('success_1d', 'count')] >= 3:
-                        system_rankings.append({
-                            "system": str(system),
-                            "success_rate": float(system_performance.loc[system, ('success_1d', 'mean')] * 100),
-                            "avg_return": float(system_performance.loc[system, ('return_1d', 'mean')]),
-                            "signal_count": int(system_performance.loc[system, ('success_1d', 'count')])
-                        })
-                
-                # Rank systems by success rate
-                system_rankings.sort(key=lambda x: x["success_rate"], reverse=True)
-                for i, system in enumerate(system_rankings):
-                    system["rank"] = i + 1
-                
-                results["system_rankings"] = system_rankings
-            
-            return results
-            
-        except Exception as e:
-            return {"error": f"System correlation analysis failed: {e}"}
-    
     async def analyze_statistical_significance(self, df: pd.DataFrame) -> Dict:
         """Analyze statistical significance of patterns"""
         try:
@@ -484,8 +384,8 @@ class AdvancedAnalytics:
         """Calculate a data quality score based on completeness and reliability"""
         try:
             # Key field completeness
-            key_fields = ['price_at_signal', 'price_after_1h', 'price_after_6h', 'price_after_1d', 
-                         'success_1h', 'success_6h', 'success_1d']
+            key_fields = ['price_at_signal', 'price_after_1h', 'price_after_4h', 'price_after_1d', 
+                         'success_1h', 'success_4h', 'success_1d']
             
             completeness_scores = []
             for field in key_fields:
@@ -518,12 +418,12 @@ class AdvancedAnalytics:
             return 0.5  # Default medium quality
     
     async def get_ml_predictions(self, days: int = 90) -> Dict:
-        """Use machine learning to predict signal success probability"""
+        """Enhanced ML predictions with feature analysis and ensemble methods"""
         try:
             conn = await asyncpg.connect(self.db_url)
             since_date = datetime.now() - timedelta(days=days)
             
-            # Get comprehensive training data
+            # Get comprehensive signal data for ML training (using actual available columns)
             training_data = await conn.fetch('''
                 SELECT 
                     sp.ticker,
@@ -532,10 +432,11 @@ class AdvancedAnalytics:
                     sp.signal_date,
                     sp.price_at_signal,
                     sp.price_after_1h,
-                    sp.price_after_6h,
+                    sp.price_after_4h,
                     sp.price_after_1d,
-                    sp.strength,
-                    sp.system,
+                    sp.success_1h,
+                    sp.success_4h,
+                    sp.success_1d,
                     EXTRACT(hour FROM sp.signal_date) as signal_hour,
                     EXTRACT(dow FROM sp.signal_date) as signal_dow,
                     EXTRACT(day FROM sp.signal_date) as signal_day,
@@ -543,19 +444,12 @@ class AdvancedAnalytics:
                         WHEN sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%' THEN 1
                         WHEN sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%' THEN -1
                         ELSE 0
-                    END as signal_direction_encoded,
-                    CASE 
-                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
-                             AND sp.price_after_1d > sp.price_at_signal THEN 1
-                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
-                             AND sp.price_after_1d < sp.price_at_signal THEN 1
-                        ELSE 0
-                    END as success_1d
+                    END as signal_direction_encoded
                 FROM signal_performance sp
                 WHERE sp.performance_date >= $1
                   AND sp.price_at_signal IS NOT NULL 
                   AND sp.price_after_1d IS NOT NULL
-                  AND sp.price_after_6h IS NOT NULL
+                  AND sp.price_after_4h IS NOT NULL
                   AND sp.price_after_1h IS NOT NULL
                 ORDER BY sp.signal_date DESC
             ''', since_date)
@@ -589,18 +483,10 @@ class AdvancedAnalytics:
             df_encoded['timeframe_encoded'] = le_timeframe.fit_transform(df['timeframe'])
             df_encoded['signal_type_encoded'] = le_signal_type.fit_transform(df['signal_type'])
             
-            # Handle missing strength/system data
-            df_encoded['strength'] = df_encoded['strength'].fillna(df_encoded['strength'].median())
-            df_encoded['system_encoded'] = 0  # Default for missing system data
-            if 'system' in df_encoded.columns and not df_encoded['system'].isna().all():
-                le_system = LabelEncoder()
-                df_encoded['system_encoded'] = le_system.fit_transform(df_encoded['system'].fillna('unknown'))
-            
-            # Create enhanced feature matrix
+            # Create enhanced feature matrix using available columns
             features = [
                 'ticker_encoded', 'timeframe_encoded', 'signal_type_encoded',
-                'signal_hour', 'signal_dow', 'signal_day', 'signal_direction_encoded',
-                'strength', 'system_encoded'
+                'signal_hour', 'signal_dow', 'signal_day', 'signal_direction_encoded'
             ]
             
             X = df_encoded[features]
@@ -724,15 +610,7 @@ class AdvancedAnalytics:
                     sp.ticker,
                     sp.timeframe,
                     sp.signal_type,
-                    sp.strength,
-                    sp.system,
-                    CASE 
-                        WHEN (sp.signal_type ILIKE '%bullish%' OR sp.signal_type ILIKE '%buy%' OR sp.signal_type ILIKE '%oversold%' OR sp.signal_type ILIKE '%entry%')
-                             AND sp.price_after_1d > sp.price_at_signal THEN 1
-                        WHEN (sp.signal_type ILIKE '%bearish%' OR sp.signal_type ILIKE '%sell%' OR sp.signal_type ILIKE '%overbought%')
-                             AND sp.price_after_1d < sp.price_at_signal THEN 1
-                        ELSE 0
-                    END as success_1d,
+                    sp.success_1d,
                     EXTRACT(hour FROM sp.signal_date) as signal_hour,
                     EXTRACT(dow FROM sp.signal_date) as signal_dow
                 FROM signal_performance sp
@@ -774,7 +652,7 @@ class AdvancedAnalytics:
             # Calculate success probability
             success_rate = similar_signals['success_1d'].mean()
             
-            # Adjust based on signal strength
+            # Adjust based on signal strength (if provided in features)
             strength_multiplier = {
                 'Very Strong': 1.2,
                 'Strong': 1.1,
