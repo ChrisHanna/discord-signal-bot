@@ -1110,7 +1110,7 @@ class SignalNotifier:
                         recent_signals.append(signal)
                         
                         # Enhanced debug info
-                        age_str = f"{time_diff.total_seconds()/3600:.1f}h" if timeframe == '1h' else f\"{time_diff.total_seconds()/3600:.1f}h\"
+                        age_str = f"{time_diff.total_seconds()/3600:.1f}h"
                         print(f"   ✅ {signal.get('type', 'Unknown')} ({signal.get('strength', 'Unknown')}) - {age_str} ago")
                     
                 except Exception as e:
