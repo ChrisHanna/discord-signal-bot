@@ -1361,15 +1361,15 @@ class SignalNotifier:
             message += f"\n{priority_display}"
             
             # Determine embed color based on priority level
-                priority_colors = {
-                    'CRITICAL': 0xFF0000,  # Red
-                    'HIGH': 0xFF6600,      # Orange  
-                    'MEDIUM': 0x0099FF,    # Blue
-                    'LOW': 0x00FF00,       # Green
-                    'MINIMAL': 0x808080    # Gray
-                }
+            priority_colors = {
+                'CRITICAL': 0xFF0000,  # Red
+                'HIGH': 0xFF6600,      # Orange  
+                'MEDIUM': 0x0099FF,    # Blue
+                'LOW': 0x00FF00,       # Green
+                'MINIMAL': 0x808080    # Gray
+            }
             
-                color = priority_colors.get(priority_score.priority_level.name, 0x0099ff)
+            color = priority_colors.get(priority_score.priority_level.name, 0x0099ff)
             
             # Create Discord embed
             embed = discord.Embed(
@@ -1896,17 +1896,17 @@ async def show_timer(ctx):
         status_info = smart_scheduler.get_status_info()
         
         embed = discord.Embed(
-            title="🎯 Smart Scheduler Timer",
+            title="⏰ Smart Scheduler Timer",
             color=0x00ff88,
             timestamp=datetime.now(EST)
         )
         
-                embed.add_field(
+        embed.add_field(
             name="⏳ Next Check",
             value=f"`{status_info['time_until_next']}`",
-                    inline=True
-                )
-            
+            inline=True
+        )
+        
         embed.add_field(
             name="🕐 Next Check Time (EST)",
             value=f"`{status_info['next_run_time']}`",
