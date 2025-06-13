@@ -1278,4 +1278,18 @@ async def record_signal_performance(ticker: str, timeframe: str, signal_type: st
     """Record signal performance data for success rate calculations"""
     return await db_manager.record_signal_performance(ticker, timeframe, signal_type, signal_date,
                                                  price_at_signal, price_after_1h, price_after_4h,
-                                                 price_after_1d, price_after_3d) 
+                                                 price_after_1d, price_after_3d)
+
+# --- Active Timeframe Management (exported functions) ---
+
+async def get_active_timeframes() -> list:
+    """Get the list of active timeframes from the database."""
+    return await db_manager.get_active_timeframes()
+
+async def add_active_timeframe(timeframe: str) -> bool:
+    """Add a timeframe to the active_timeframes table."""
+    return await db_manager.add_active_timeframe(timeframe)
+
+async def remove_active_timeframe(timeframe: str) -> bool:
+    """Remove a timeframe from the active_timeframes table."""
+    return await db_manager.remove_active_timeframe(timeframe) 
