@@ -1150,6 +1150,36 @@ class DatabaseManager:
             self.logger.error(f"❌ Error recording signal performance: {e}")
             return False
 
+    async def get_active_timeframes(self) -> list:
+        """Get the list of active timeframes from the database."""
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch('SELECT timeframe FROM active_timeframes ORDER BY id')
+                return [row['timeframe'] for row in rows]
+        except Exception as e:
+            print(f"❌ Error loading active timeframes: {e}")
+            return []
+
+    async def add_active_timeframe(self, timeframe: str) -> bool:
+        """Add a timeframe to the active_timeframes table."""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('INSERT INTO active_timeframes (timeframe) VALUES ($1) ON CONFLICT (timeframe) DO NOTHING', timeframe)
+                return True
+        except Exception as e:
+            print(f"❌ Error adding active timeframe: {e}")
+            return False
+
+    async def remove_active_timeframe(self, timeframe: str) -> bool:
+        """Remove a timeframe from the active_timeframes table."""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('DELETE FROM active_timeframes WHERE timeframe = $1', timeframe)
+                return True
+        except Exception as e:
+            print(f"❌ Error removing active timeframe: {e}")
+            return False
+
 # Global database manager instance
 db_manager = DatabaseManager()
 

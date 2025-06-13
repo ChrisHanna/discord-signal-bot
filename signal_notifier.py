@@ -128,7 +128,7 @@ class DatabaseConfig:
     
     def __init__(self):
         self.tickers = []
-        self.timeframes = ['1d', '1h']  # Default timeframes
+        self.timeframes = []  # Will be loaded from DB
         self.max_tickers = 50
         self.allowed_timeframes = ['15m', '30m', '1h', '3h', '6h', '1d', '2d', '3d', '1wk']
         
@@ -136,26 +136,25 @@ class DatabaseConfig:
         """Load configuration from PostgreSQL database"""
         try:
             print("🔄 Loading configuration from PostgreSQL database...")
-            
-            # Load tickers from database
             self.tickers = await get_database_tickers()
-            
+            from database import get_active_timeframes, add_active_timeframe
+            self.timeframes = await get_active_timeframes()
             if not self.tickers:
-                # Initialize with default popular tickers if database is empty
                 default_tickers = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA']
                 print(f"📊 Initializing database with default tickers: {default_tickers}")
-                
                 for ticker in default_tickers:
                     await add_ticker_to_database(ticker)
-                    
                 self.tickers = default_tickers
-            
-            print(f"✅ Loaded {len(self.tickers)} tickers from database: {', '.join(self.tickers[:10])}{'...' if len(self.tickers) > 10 else ''}")
+            if not self.timeframes:
+                default_timeframes = ['1d', '3h', '6h']
+                print(f"⏱️ Initializing database with default timeframes: {default_timeframes}")
+                for tf in default_timeframes:
+                    await add_active_timeframe(tf)
+                self.timeframes = default_timeframes
+            print(f"✅ Loaded {len(self.tickers)} tickers and {len(self.timeframes)} timeframes from database.")
             return True
-            
         except Exception as e:
             print(f"❌ Error loading configuration from database: {e}")
-            # Fallback to environment variables if database fails
             self.load_from_environment()
             return False
     
@@ -168,7 +167,7 @@ class DatabaseConfig:
         self.tickers = [ticker.strip().upper() for ticker in tickers_str.split(',') if ticker.strip()]
         
         # Load timeframes from environment
-        timeframes_str = os.getenv('TIMEFRAMES', '1d,1h')
+        timeframes_str = os.getenv('TIMEFRAMES', '1d,3h,6h')
         self.timeframes = [tf.strip() for tf in timeframes_str.split(',') if tf.strip()]
         
         print(f"📊 Loaded from environment: {len(self.tickers)} tickers, {len(self.timeframes)} timeframes")
@@ -225,6 +224,37 @@ class DatabaseConfig:
             for timeframe in self.timeframes:
                 combinations.append((ticker, timeframe))
         return combinations
+
+    async def add_timeframe(self, timeframe: str) -> bool:
+        try:
+            from database import add_active_timeframe
+            if timeframe in self.timeframes:
+                return False
+            success = await add_active_timeframe(timeframe)
+            if success:
+                self.timeframes.append(timeframe)
+                self.timeframes.sort()
+                return True
+            return False
+        except Exception as e:
+            print(f"❌ Error adding timeframe {timeframe}: {e}")
+            return False
+
+    async def remove_timeframe(self, timeframe: str) -> bool:
+        try:
+            from database import remove_active_timeframe
+            if timeframe not in self.timeframes:
+                return False
+            if len(self.timeframes) <= 1:
+                return False
+            success = await remove_active_timeframe(timeframe)
+            if success:
+                self.timeframes.remove(timeframe)
+                return True
+            return False
+        except Exception as e:
+            print(f"❌ Error removing timeframe {timeframe}: {e}")
+            return False
 
 # Initialize database config
 config = DatabaseConfig()
@@ -2744,103 +2774,75 @@ async def list_tickers_command(ctx):
 
 @bot.command(name='timeframes')
 async def timeframes_command(ctx, action: str = None, timeframe: str = None):
-    """Manage timeframes: !timeframes list|add|remove [timeframe]"""
     global config
     try:
+        await config.load_from_database()  # Always reload from DB for latest
         current_timeframes = config.timeframes
         allowed_timeframes = config.allowed_timeframes
-        
         if not action:
             action = 'list'
-            
         action = action.lower()
-        
         if action == 'list':
             embed = discord.Embed(
                 title="⏱️ Timeframe Configuration",
                 color=0x0099ff
             )
-            
-            # Current timeframes
             tf_text = ", ".join(f"`{tf}`" for tf in current_timeframes)
             embed.add_field(name="📊 Active Timeframes", value=tf_text, inline=False)
-            
-            # Available timeframes
             available_text = ", ".join(f"`{tf}`" for tf in allowed_timeframes)
             embed.add_field(name="✅ Available Timeframes", value=available_text, inline=False)
-            
-            # Statistics
             embed.add_field(
                 name="📈 Impact",
-                value=f"**Tickers**: {len(config.tickers)}\n"
-                      f"**Timeframes**: {len(current_timeframes)}\n"
-                      f"**Total Combinations**: {len(TICKER_TF_COMBINATIONS)}",
+                value=f"**Tickers**: {len(config.tickers)}\n**Timeframes**: {len(current_timeframes)}\n**Total Combinations**: {len(TICKER_TF_COMBINATIONS)}",
                 inline=False
             )
-            
             embed.add_field(
                 name="🛠️ Commands",
-                value="`!timeframes add 1h` - Add timeframe\n"
-                      "`!timeframes remove 1h` - Remove timeframe",
+                value="`!timeframes add 1h` - Add timeframe\n`!timeframes remove 1h` - Remove timeframe",
                 inline=False
             )
-            
             embed.add_field(
                 name="💾 Data Source",
                 value="✅ PostgreSQL Database",
                 inline=False
             )
-            
             await ctx.send(embed=embed)
-            
         elif action == 'add':
             if not timeframe:
                 await ctx.send("❌ Please specify a timeframe to add\nExample: `!timeframes add 1h`")
                 return
-                
             timeframe = timeframe.lower()
-            
             if timeframe not in allowed_timeframes:
-                await ctx.send(f"❌ **{timeframe}** is not a supported timeframe\n"
-                              f"Available: {', '.join(allowed_timeframes)}")
+                await ctx.send(f"❌ **{timeframe}** is not a supported timeframe\nAvailable: {', '.join(allowed_timeframes)}")
                 return
-                
             if timeframe in current_timeframes:
                 await ctx.send(f"⚠️ **{timeframe}** is already active")
                 return
-                
-            # Add timeframe
-            current_timeframes.append(timeframe)
-            config.timeframes = current_timeframes
-            
-            # Update globals
-            build_ticker_combinations()
-            
-            embed = discord.Embed(
-                title="✅ Timeframe Added!",
-                description=f"**{timeframe}** has been added to active timeframes",
-                color=0x00ff00
-            )
-            embed.add_field(
-                name="📊 New Status",
-                value=f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n"
-                      f"({len(config.tickers)} tickers × {len(config.timeframes)} timeframes)",
-                inline=False
-            )
-            
-            await ctx.send(embed=embed)
-            
+            success = await config.add_timeframe(timeframe)
+            if success:
+                await config.load_from_database()
+                build_ticker_combinations()
+                embed = discord.Embed(
+                    title="✅ Timeframe Added!",
+                    description=f"**{timeframe}** has been added to active timeframes",
+                    color=0x00ff00
+                )
+                embed.add_field(
+                    name="📊 New Status",
+                    value=f"Total combinations: **{len(TICKER_TF_COMBINATIONS)}**\n({len(config.tickers)} tickers × {len(config.timeframes)} timeframes)",
+                    inline=False
+                )
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send(f"❌ Failed to add timeframe {timeframe}.")
         elif action == 'remove':
             if not timeframe:
                 await ctx.send("❌ Please specify a timeframe to remove\nExample: `!timeframes remove 1h`")
                 return
-                
             timeframe = timeframe.lower()
-            
             if timeframe not in current_timeframes:
                 await ctx.send(f"⚠️ **{timeframe}** is not currently active")
                 return
-                
             if len(current_timeframes) <= 1:
                 await ctx.send("❌ Cannot remove the last timeframe. At least one must be active.")
                 return
