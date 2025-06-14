@@ -2687,7 +2687,7 @@ async def remove_ticker_command(ctx, ticker: str):
     except Exception as e:
         await ctx.send(f"❌ Error removing ticker: {str(e)}")
 
-@bot.command(name='listtickers')
+@bot.command(name='listtickers', aliases=['tickers'])
 async def list_tickers_command(ctx):
     """List all currently monitored tickers"""
     try:
