@@ -1110,6 +1110,7 @@ class SignalNotifier:
                 max_hours_ago = 0.83  # 50 minutes - balance between timeliness and API delay tolerance
                 print(f" Filtering for signals within last {max_hours_ago * 60:.0f} minutes")
             else:
+                max_hours_ago = 2.83
                 print(f" Filtering for signals within last {max_hours_ago * 60:.0f} minutes")
                 print(f"📅 Filtering for signals within last {max_hours_ago} hours")
             
