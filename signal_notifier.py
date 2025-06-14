@@ -1643,19 +1643,6 @@ async def signal_check_loop():
         current_hour = cycle_start.hour
         
         for ticker in TICKERS:
-            for timeframe in TIMEFRAMES:
-                # ⏰ TIMEFRAME-AWARE CHECKING: Only check timeframes at their candle close times
-                if timeframe == '3h' and current_hour not in [23, 2, 5, 8, 11, 14, 17, 20]:
-                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 3h candle close hour")
-                    continue
-                elif timeframe == '6h' and current_hour not in [2, 8, 14, 20]:
-                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a 6h candle close hour")
-                    continue  
-                elif timeframe == '1d' and current_hour % 4 != 0:  # Every 4 hours for stocks (16:xx) and crypto (20:xx)
-                    print(f"⏭️ Skipping {ticker} ({timeframe}) - not a daily candle close hour (checks at 00, 04, 08, 12, 16, 20)")
-                    continue
-                # 1h timeframe runs every hour (no skip condition)
-                
                 try:
                     print(f"\n📊 Checking {ticker} ({timeframe})...")
                     
